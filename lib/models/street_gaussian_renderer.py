@@ -59,9 +59,11 @@ class StreetGaussianRenderer():
         depth_threshold = 0.37,
         exclude_list = [],
         custom_rotation=None, 
-        custom_translation=None
+        custom_translation=None,
+        include_list = []
     ):   
-        include_list = list(set(pc.obj_list) - set(exclude_list))
+        if len(include_list) == 0:
+            include_list = list(set(pc.obj_list) - set(exclude_list))
         pc.set_visibility(include_list)
         pc.parse_camera(viewpoint_camera, custom_rotation, custom_translation)
         

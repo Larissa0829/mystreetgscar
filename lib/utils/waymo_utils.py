@@ -390,7 +390,9 @@ def generate_dataparser_outputs(
         object_end_timestamp = timestamps['FRAME'][f'{object_end_frame:06d}'] - timestamp_offset + 0.1
         object_info[track_id]['start_timestamp'] = max(object_start_timestamp, min_timestamp)
         object_info[track_id]['end_timestamp'] = min(object_end_timestamp, max_timestamp)
-        
+        # # 深拷贝一份object_info[track_id]给object_info[track_id+'_sample']
+        # object_info[track_id+'_sample'] = object_info[track_id].copy()
+
     result = dict()
     result['num_frames'] = num_frames
     result['exts'] = exts

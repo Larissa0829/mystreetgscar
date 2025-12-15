@@ -125,6 +125,14 @@ class StreetGaussianModel(nn.Module):
                 plydata_list = PlyData.read(path).elements
                 
         self.active_sh_degree = self.max_sh_degree
+
+    def load_sample_ply(self, path):
+        plydata = PlyData.read(path).elements[0]
+        model_name = "sample"
+        print('Loading model', model_name)
+        model: GaussianModelActor = getattr(self, model_name)
+        model.load_ply(path=None, input_ply=plydata)
+        self.active_sh_degree = self.max_sh_degree
   
     def load_state_dict(self, state_dict, exclude_list=[]):
         for model_name in self.model_name_id.keys():

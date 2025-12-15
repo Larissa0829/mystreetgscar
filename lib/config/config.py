@@ -80,7 +80,6 @@ cfg.optim.lambda_pose_correction = 0.
 cfg.optim.lambda_scale_flatten = 0.
 cfg.optim.lambda_opacity_sparse = 0.
 cfg.optim.lambda_lpips = 0.05
-cfg.optim.isDifix = True
 
 
 cfg.model = CN()

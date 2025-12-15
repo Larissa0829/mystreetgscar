@@ -47,7 +47,7 @@ class StreetGaussianVisualizer():
 
         
         # ============ 创建difix3d
-        if cfg.optim.isDifix:
+        if cfg.data.isDifix:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             to_tensor = transforms.ToTensor()
             # rgb

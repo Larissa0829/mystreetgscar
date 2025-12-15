@@ -5,6 +5,7 @@ from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim
 from lib.utils.img_utils import save_img_torch, visualize_depth_numpy
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer
 from lib.models.street_gaussian_model import StreetGaussianModel
+from lib.models.gaussian_model_actor import GaussianModelActor
 from lib.utils.general_utils import safe_state
 from lib.utils.camera_utils import Camera
 from lib.utils.cfg_utils import save_cfg
@@ -19,12 +20,17 @@ import time
 import sys
 from torchvision import transforms
 import torch.nn.functional as F
+import torchvision.transforms as T
+import numpy as np
 
 
 # 第四章 补全车辆 引入difix3d
 # 添加 Difix3D/src 目录到 Python 路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Difix3D', 'src'))
 from pipeline_difix import DifixPipeline
+# 添加 TRELLIS目录到python路径
+sys.path.append(os.path.join(os.path.dirname(__file__), 'TRELLIS'))
+
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -49,8 +55,8 @@ def training():
     gaussians.training_setup()
 
     # ============ 创建difix3d
-    if optim_args.isDifix:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if data_args.isDifix:
         # 有两种，一种是不需要ref的
         difixPipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
         # 一种是需要ref的
@@ -254,7 +260,7 @@ def training():
 
         # difix3d loss: 目前想法是把difix3d嵌入 生成一个去除伪影的效果，来得到完整的车辆。
         to_tensor = transforms.ToTensor()
-        if optim_args.isDifix and iteration % 1000 == 0:
+        if data_args.isDifix and iteration % 2500 == 0:
             # rgb
             difix_rgb = to_tensor(difixPipe(difixPrompt, image=image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
             difix_rgb = F.interpolate(difix_rgb.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
@@ -262,7 +268,7 @@ def training():
             scalar_dict['difix3d_loss'] = Ll1.item()
             loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, difix_rgb, mask=mask))
 
-        if optim_args.isDifix and iteration >= 15000 and iteration % 100 == 0:
+        if data_args.isDifix and iteration >= 16001 and iteration % 500 == 0:
             # obj + 随机移动或旋转
             if gaussians.include_obj:
                 with torch.no_grad():
@@ -280,7 +286,6 @@ def training():
                     loss += optim_args.lambda_lpips * lpips_loss.squeeze()
                     
                     # 存储车辆部分的图像，方便查看
-                    import torchvision.transforms as T
                     transform = T.ToPILImage()
                     # if rgb_obj.max() > 1.0:
                     #     rgb_obj = rgb_obj / 255.0
@@ -290,6 +295,176 @@ def training():
                     #     difix_rgb_obj = difix_rgb_obj / 255.0
                     image_pil = transform(difix_rgb_obj.cpu())  # 确保 image 在 CPU 上
                     image_pil.save("difix_rgb_obj.png")
+
+        # ================================ TRELLIS 单帧点云模板生成（作为独立对象）================================
+        if iteration == 16001 and gaussians.include_obj and data_args.isTrellis:
+            os.environ['SPCONV_ALGO'] = 'native'
+            from PIL import Image
+            from trellis.pipelines import TrellisImageTo3DPipeline
+            from lib.utils.general_utils import matrix_to_quaternion, quaternion_raw_multiply
+            
+            print("=" * 80)
+            print("TRELLIS 点云模板生成与对齐")
+            print("=" * 80)
+            
+            ply_file_path = f"{cfg.model_path}/input_ply"
+            os.makedirs(ply_file_path, exist_ok=True)
+            
+            # ============ 阶段1: 生成点云 ============
+            print("\n[阶段1] 生成TRELLIS点云模板...")
+            trellis_pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
+            trellis_pipeline.to(device)
+            
+            for obj_name in gaussians.obj_list:
+                if obj_name in ['sky', 'background']:
+                    continue
+                
+                sample_ply = f"{ply_file_path}/{obj_name}_sample.ply"
+                if os.path.exists(sample_ply):
+                    print(f"  ✓ {obj_name}_sample.ply 已存在，跳过生成")
+                    continue
+                
+                print(f"\n  生成 {obj_name} 的点云...")
+                
+                try:
+                    # 渲染对象图像
+                    with torch.no_grad():
+                        render_obj = gaussians_renderer.render_object(
+                            viewpoint_cam, gaussians, 
+                            custom_rotation=None, custom_translation=None,
+                            include_list=[obj_name]
+                        )
+                        rgb_obj = torch.clamp(render_obj["rgb"], 0, 1).permute(1, 2, 0)
+                        alpha = torch.clamp(render_obj['acc'], 0, 1).permute(1, 2, 0)
+                        rgba = torch.cat([rgb_obj, alpha], dim=-1)
+                        image_pil = Image.fromarray((rgba * 255).byte().cpu().numpy(), mode="RGBA")
+                        image_pil.save(f"{ply_file_path}/{obj_name}_input.png")
+                    
+                    # 运行TRELLIS生成点云
+                    outputs = trellis_pipeline.run(
+                        image_pil, seed=1, formats=['gaussian'],
+                        sparse_structure_sampler_params={"steps": 12, "cfg_strength": 7.5},
+                        slat_sampler_params={"steps": 12, "cfg_strength": 3}
+                    )
+                    obj_trellis_ply = outputs['gaussian'][0]
+                    
+                    # 添加高阶球谐系数
+                    if obj_trellis_ply._features_rest is None:
+                        num_points = obj_trellis_ply._features_dc.shape[0]
+                        obj_trellis_ply._features_rest = torch.zeros(
+                            (num_points, 15, 3),  # sh_degree=3: (3+1)^2-1=15
+                            dtype=obj_trellis_ply._features_dc.dtype,
+                            device=obj_trellis_ply._features_dc.device
+                        )
+                        obj_trellis_ply.sh_degree = obj_trellis_ply.active_sh_degree = 3
+                    
+                    obj_trellis_ply.save_ply(sample_ply)
+                    print(f"    ✓ 已保存: {sample_ply} ({num_points} 点)")
+                    
+                except Exception as e:
+                    print(f"    ⚠️ TRELLIS生成失败: {str(e)}")
+                    print(f"    跳过 {obj_name}，继续处理下一个对象")
+                    continue
+                
+                torch.cuda.empty_cache()
+            
+            del trellis_pipeline
+            torch.cuda.empty_cache()
+            
+
+            # ============ 阶段2: 创建并对齐sample对象 ============
+            print("\n[阶段2] 创建独立的sample对象并对齐...")
+            
+            # 坐标系转换矩阵（TRELLIS坐标系 → 目标坐标系）
+            transform_matrix = torch.tensor([
+                [0,  0, -1],  # X: -Z
+                [1,  0,  0],  # Y: +X
+                [0, -1,  0]   # Z: -Y
+            ], device='cuda', dtype=torch.float32)
+            transform_quat = matrix_to_quaternion(transform_matrix.unsqueeze(0)).squeeze(0)
+            
+            obj_list = gaussians.obj_list.copy()  # 避免迭代时修改列表
+            for obj_name in obj_list:
+                if obj_name in ['sky', 'background']:
+                    continue
+                
+                sample_name = f"{obj_name}_sample"
+                sample_ply = f"{ply_file_path}/{sample_name}.ply"
+                if not os.path.exists(sample_ply):
+                    continue
+                
+                print(f"\n  创建 {sample_name}...")
+                actor: GaussianModelActor = getattr(gaussians, obj_name)
+                
+                # 加载点云
+                sample_actor = GaussianModelActor(model_name=sample_name, obj_meta=actor.obj_meta)
+                sample_actor.load_ply(sample_ply)
+                print(f"    点数: {sample_actor._xyz.shape[0]}")
+                
+                with torch.no_grad():
+                    # 1. 坐标转换与缩放
+                    template_xyz = sample_actor._xyz.data.cuda()
+                    t_center = (template_xyz.min(dim=0)[0] + template_xyz.max(dim=0)[0]) / 2
+                    template_xyz_transformed = torch.matmul(template_xyz - t_center, transform_matrix.T)
+                    
+                    # 计算缩放因子（基于最大维度）
+                    t_scale = template_xyz_transformed.max(dim=0)[0] - template_xyz_transformed.min(dim=0)[0]
+                    obj_xyz = actor._xyz.data
+                    obj_scale = obj_xyz.max(dim=0)[0] - obj_xyz.min(dim=0)[0]
+                    scale_factor = obj_scale.max() / (t_scale.max() + 1e-8)
+                    
+                    template_xyz_scaled = template_xyz_transformed * scale_factor
+                    print(f"    缩放因子: {scale_factor.item():.4f}")
+                    
+                    # 2. 更新所有参数
+                    sample_actor._xyz = torch.nn.Parameter(template_xyz_scaled.requires_grad_(True))
+                    sample_actor._rotation = torch.nn.Parameter(quaternion_raw_multiply(transform_quat.unsqueeze(0).expand(sample_actor._rotation.shape[0], -1),sample_actor._rotation.data.cuda()).requires_grad_(True))
+                    sample_actor._scaling = torch.nn.Parameter((sample_actor._scaling.data.cuda() + torch.log(scale_factor)).requires_grad_(True))
+                    sample_actor._opacity = torch.nn.Parameter(sample_actor._opacity.data.cuda().requires_grad_(True))
+                    sample_actor._semantic = torch.nn.Parameter(sample_actor._semantic.data.cuda().requires_grad_(True))
+                    
+                    # 3. 调整特征维度
+                    if sample_actor._features_dc.shape[1] != actor._features_dc.shape[1]:
+                        sample_actor._features_dc = torch.nn.Parameter(
+                            sample_actor._features_dc.data.cuda()[:, :actor._features_dc.shape[1], :].requires_grad_(True)
+                        )
+                    else:
+                        sample_actor._features_dc = torch.nn.Parameter(sample_actor._features_dc.data.cuda().requires_grad_(True))
+                    
+                    if sample_actor._features_rest.shape[1] != actor._features_rest.shape[1]:
+                        sample_actor._features_rest = torch.nn.Parameter(
+                            torch.zeros((sample_actor._xyz.shape[0], actor._features_rest.shape[1], 3), device='cuda').requires_grad_(True)
+                        )
+                    else:
+                        sample_actor._features_rest = torch.nn.Parameter(sample_actor._features_rest.data.cuda().requires_grad_(True))
+                    
+                    sample_actor.max_sh_degree = actor.max_sh_degree
+                    sample_actor.active_sh_degree = actor.active_sh_degree
+                
+                # 4. 初始化训练参数
+                sample_actor.training_setup()
+                sample_actor.max_radii2D = torch.zeros(sample_actor._xyz.shape[0], dtype=torch.float32, device=sample_actor.max_radii2D.device).cuda()
+                sample_actor.xyz_gradient_accum = sample_actor.xyz_gradient_accum.cuda()
+                sample_actor.denom = sample_actor.denom.cuda()
+                
+                # 5. 注册到场景
+                setattr(gaussians, sample_name, sample_actor)
+                gaussians.model_name_id[sample_name] = gaussians.models_num
+                gaussians.obj_list.append(sample_name)
+                gaussians.models_num += 1
+                
+                print(f"    ✓ 已注册，track_id={actor.track_id}（跟随{obj_name}）")
+            
+            print("\n" + "=" * 80)
+            print(f"✓ 完成! 总对象数: {gaussians.models_num}")
+            print("=" * 80)
+            torch.cuda.empty_cache()
+            
+            # 跳过当前迭代以重新解析场景
+            progress_bar.update(1)
+            continue
+        # ================================
+
             
         scalar_dict['loss'] = loss.item()
 
@@ -298,7 +473,7 @@ def training():
         iter_end.record()
                 
         is_save_images = True
-        if is_save_images and (iteration % 1000 == 0):
+        if is_save_images and (iteration % 1000 == 2):
             # row0: gt_image, image, depth
             # row1: acc, image_obj, acc_obj
             depth_colored, _ = visualize_depth_numpy(depth.detach().cpu().numpy().squeeze(0))
@@ -311,7 +486,15 @@ def training():
                 image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
             acc_obj = acc_obj.repeat(3, 1, 1)
             row1 = torch.cat([acc, image_obj, acc_obj], dim=2)
-            image_to_show = torch.cat([row0, row1], dim=1)
+            with torch.no_grad():
+                obj_name = gaussians.obj_list[0]
+                image_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,include_list=obj_name)["rgb"]
+                render_obj2 = gaussians_renderer.render_object(viewpoint_cam, gaussians,include_list=obj_name+"_sample")
+                image_obj_sample2, acc_obj_sample2 = render_obj2["rgb"],render_obj2["acc"]
+            acc_obj_sample2 = acc_obj_sample2.repeat(3, 1, 1)
+            row2 = torch.cat([image_obj, image_obj_sample2, acc_obj_sample2], dim=2) # 原始车 + sample + sample_acc
+
+            image_to_show = torch.cat([row0, row1, row2], dim=1)
             image_to_show = torch.clamp(image_to_show, 0.0, 1.0)
             os.makedirs(f"{cfg.model_path}/log_images", exist_ok = True)
             save_img_torch(image_to_show, f"{cfg.model_path}/log_images/{iteration}.jpg")

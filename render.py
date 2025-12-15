@@ -106,7 +106,7 @@ if __name__ == "__main__":
 
     difixPipe = None
     difixPrompt = None
-    if cfg.optim.isDifix:
+    if cfg.data.isDifix:
         from pipeline_difix import DifixPipeline
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # 有两种，一种是不需要ref的

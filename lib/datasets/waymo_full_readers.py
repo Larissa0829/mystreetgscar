@@ -61,7 +61,7 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
     load_mono_depth = cfg.data.use_mono_depth and (cfg.mode == 'train') and os.path.exists(mono_depth_dir)
 
     output = generate_dataparser_outputs(
-        datadir=path, 
+        datadir=path,
         selected_frames=selected_frames,
         build_pointcloud=build_pointcloud,
         cameras=cfg.data.get('cameras', [0, 1, 2]),
@@ -242,6 +242,18 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
     else:
         point_cloud = None
         bkgd_ply_path = None
+
+    # 把sample.ply的内容复制到input_ply文件夹里
+    source_ply = os.path.join(cfg.workspace, 'data', 'carsample', 'sample.ply')
+    target_dir = os.path.join(cfg.model_path, 'input_ply')
+    os.makedirs(target_dir, exist_ok=True)
+    shutil.copy(source_ply, target_dir)
+    print(f"Copied {source_ply} to {target_dir}")
+    # # 加载sample.ply到scene_metadata场景中
+    # sample_ply = f"{target_dir}/sample.ply"
+    # self.gaussians.load_ply(sample_ply)
+    # # sample_pcd: BasicPointCloud = fetchPly(sample_ply)
+    # scene_metadata['sample_pcd'] = sample_pcd
 
     scene_info = SceneInfo(
         point_cloud=point_cloud,

@@ -16,6 +16,12 @@ class Scene:
         self.dataset = dataset
         self.gaussians = gaussians
         
+        # # 加载sample.ply到scene_metadata场景中
+        # target_dir = os.path.join(cfg.model_path, 'input_ply')
+        # sample_ply = f"{target_dir}/sample.ply"
+        # self.gaussians.load_sample_ply(sample_ply)
+    
+        
         if cfg.mode == 'train':
             point_cloud = self.dataset.scene_info.point_cloud
             scene_raidus = self.dataset.scene_info.metadata['scene_radius']

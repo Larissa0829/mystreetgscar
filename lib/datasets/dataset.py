@@ -31,7 +31,7 @@ class Dataset():
 
         if cfg.mode == 'train':
             print(f'Saving input pointcloud to {os.path.join(self.model_path, "input.ply")}')
-            pcd = scene_info.point_cloud
+            pcd = scene_info.point_cloud # bkgd
             storePly(os.path.join(self.model_path, "input.ply"), pcd.points, pcd.colors)
 
             json_cams = []
