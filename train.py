@@ -296,6 +296,7 @@ def training():
                     image_pil = transform(difix_rgb_obj.cpu())  # 确保 image 在 CPU 上
                     image_pil.save("difix_rgb_obj.png")
 
+
         # ================================ TRELLIS 单帧点云模板生成（作为独立对象）================================
         if iteration == 16001 and gaussians.include_obj and data_args.isTrellis:
             os.environ['SPCONV_ALGO'] = 'native'
@@ -460,11 +461,39 @@ def training():
             print("=" * 80)
             torch.cuda.empty_cache()
             
+            # # ============ 阶段3: 对称性优化 ============
+            # print("\n[阶段3] 应用对称性优化...")
+            # from lib.utils.symmetry_utils import apply_symmetry_to_all_objects
+            
+            # # 对所有动态对象（包括 sample）应用镜像补全
+            # apply_symmetry_to_all_objects(
+            #     gaussians, 
+            #     axis=1,  # Y轴对称（左右对称）
+            #     mirror=True,  # 进行镜像补全
+            #     add_loss=False  # 此时不计算损失
+            # )
+            
+            # print("  ✓ 对称性镜像补全完成")
+            # print("=" * 80)
+            # torch.cuda.empty_cache()
+            
             # 跳过当前迭代以重新解析场景
             progress_bar.update(1)
             continue
         # ================================
-
+        
+        # # 对称性损失（从 16002 迭代开始）
+        # if iteration > 16001 and gaussians.include_obj and data_args.isTrellis:
+        #     from lib.utils.symmetry_utils import apply_symmetry_to_all_objects
+        #     symmetry_loss = apply_symmetry_to_all_objects(
+        #         gaussians, 
+        #         axis=1,  # Y轴对称
+        #         mirror=False,  # 不镜像，只计算损失
+        #         add_loss=True  # 计算对称性损失
+        #     )
+        #     if symmetry_loss is not None and symmetry_loss > 0:
+        #         scalar_dict['symmetry_loss'] = symmetry_loss.item()
+        #         loss += symmetry_loss
             
         scalar_dict['loss'] = loss.item()
 
@@ -489,10 +518,10 @@ def training():
             with torch.no_grad():
                 obj_name = gaussians.obj_list[0]
                 image_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,include_list=obj_name)["rgb"]
-                render_obj2 = gaussians_renderer.render_object(viewpoint_cam, gaussians,include_list=obj_name+"_sample")
-                image_obj_sample2, acc_obj_sample2 = render_obj2["rgb"],render_obj2["acc"]
-            acc_obj_sample2 = acc_obj_sample2.repeat(3, 1, 1)
-            row2 = torch.cat([image_obj, image_obj_sample2, acc_obj_sample2], dim=2) # 原始车 + sample + sample_acc
+                render_obj_sample = gaussians_renderer.render_object(viewpoint_cam, gaussians,include_list=obj_name+"_sample")
+                image_obj_sample, acc_obj_sample = render_obj_sample["rgb"],render_obj_sample["acc"]
+            acc_obj_sample = acc_obj_sample.repeat(3, 1, 1)
+            row2 = torch.cat([image_obj, image_obj_sample, acc_obj_sample], dim=2) # 原始车 + sample + sample_acc
 
             image_to_show = torch.cat([row0, row1, row2], dim=1)
             image_to_show = torch.clamp(image_to_show, 0.0, 1.0)
@@ -615,7 +644,7 @@ def training_report(tb_writer, iteration, scalar_stats, tensor_stats, testing_it
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test/test_view', 'cameras' : scene.getTestCameras()},
-                              {'name': 'test/train_view', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+                              {'name': 'train/train_view', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:

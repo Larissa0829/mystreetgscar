@@ -107,10 +107,47 @@ class StreetGaussianModel(nn.Module):
             plydata_list.append(plydata)
 
             # 动态对象单独保存
-            if model_name != 'background':
-                plydata = PlyElement.describe(data, f'vertex')
-                obj_path = os.path.join(base_dir, f"{model_name}.ply")
-                PlyData([plydata]).write(obj_path)
+            if model_name != 'background' and not model_name.endswith('_sample'):
+                # 检查是否有对应的 sample 对象
+                sample_name = f"{model_name}_sample"
+                if hasattr(self, sample_name) and sample_name in self.model_name_id:
+                    # 存在 sample 对象，合并保存
+                    sample_model: GaussianModel = getattr(self, sample_name)
+                    sample_data = sample_model.make_ply()
+                    
+                    # 检查 dtype 是否一致并合并
+                    import numpy as np
+                    if data.dtype == sample_data.dtype:
+                        # dtype 一致，直接拼接
+                        merged_data = np.concatenate([data, sample_data])
+                    else:
+                        # dtype 不一致，需要统一格式
+                        print(f"  警告: {sample_name} 的 dtype 与 {model_name} 不一致，正在转换...")
+                        
+                        # 创建与原始对象相同 dtype 的空数组
+                        merged_data = np.empty(len(data) + len(sample_data), dtype=data.dtype)
+                        
+                        # 复制原始数据
+                        merged_data[:len(data)] = data
+                        
+                        # 复制 sample 数据（字段对字段）
+                        for field_name in data.dtype.names:
+                            if field_name in sample_data.dtype.names:
+                                merged_data[field_name][len(data):] = sample_data[field_name]
+                            else:
+                                # 如果 sample 中没有该字段，填充默认值
+                                print(f"    警告: sample 缺少字段 {field_name}，填充为 0")
+                                merged_data[field_name][len(data):] = 0
+                    
+                    plydata = PlyElement.describe(merged_data, f'vertex')
+                    obj_path = os.path.join(base_dir, f"{model_name}.ply")
+                    PlyData([plydata]).write(obj_path)
+                    print(f"  ✓ 保存合并点云: {model_name} ({len(data)} 点) + {sample_name} ({len(sample_data)} 点) = {len(merged_data)} 点")
+                else:
+                    # 没有 sample 对象，单独保存原始点云
+                    plydata = PlyElement.describe(data, f'vertex')
+                    obj_path = os.path.join(base_dir, f"{model_name}.ply")
+                    PlyData([plydata]).write(obj_path)
 
         PlyData(plydata_list).write(path)
         
@@ -133,6 +170,110 @@ class StreetGaussianModel(nn.Module):
         model: GaussianModelActor = getattr(self, model_name)
         model.load_ply(path=None, input_ply=plydata)
         self.active_sh_degree = self.max_sh_degree
+    
+    def _load_sample_objects_from_ply(self):
+        """
+        自动检测并加载 sample 点云对象
+        在从 checkpoint 加载时调用，确保 sample 对象被正确注册
+        """
+        if not self.include_obj:
+            return
+        
+        ply_dir = os.path.join(cfg.model_path, 'input_ply')
+        if not os.path.exists(ply_dir):
+            return
+        
+        print("\n检测 sample 点云文件...")
+        loaded_samples = []
+        
+        # 遍历所有原始对象
+        for obj_name in list(self.obj_list):  # 使用 list() 复制，避免在迭代时修改
+            if obj_name in ['sky', 'background'] or obj_name.endswith('_sample'):
+                continue
+            
+            sample_name = f"{obj_name}_sample"
+            sample_ply_path = os.path.join(ply_dir, f"{sample_name}.ply")
+            
+            # 检查 sample ply 文件是否存在
+            if not os.path.exists(sample_ply_path):
+                continue
+            
+            # 检查是否已经注册
+            if hasattr(self, sample_name) and sample_name in self.model_name_id:
+                print(f"  - {sample_name}: 已注册，跳过")
+                continue
+            
+            # 获取原始对象的元数据
+            actor: GaussianModelActor = getattr(self, obj_name)
+            obj_meta = actor.obj_meta
+            
+            # 创建新的 sample 对象
+            sample_actor = GaussianModelActor(model_name=sample_name, obj_meta=obj_meta)
+            
+            # 加载 PLY 文件
+            sample_actor.load_ply(sample_ply_path)
+            
+            # 设置 track_id（与原始对象相同）
+            sample_actor.track_id = actor.track_id
+            
+            # 调整特征维度以匹配原始对象（必须在 training_setup 之前）
+            actor_fourier_dim = actor._features_dc.shape[1]
+            actor_sh_rest_dim = actor._features_rest.shape[1]
+            
+            sample_fourier_dim = sample_actor._features_dc.shape[1]
+            sample_sh_rest_dim = sample_actor._features_rest.shape[1] if sample_actor._features_rest is not None else 0
+            
+            # 调整 _features_dc
+            if sample_fourier_dim != actor_fourier_dim:
+                sample_dc = sample_actor._features_dc.data.cuda()
+                if sample_fourier_dim < actor_fourier_dim:
+                    sample_dc_new = sample_dc[:, :1, :].expand(-1, actor_fourier_dim, -1).clone()
+                else:
+                    sample_dc_new = sample_dc[:, :actor_fourier_dim, :]
+                sample_actor._features_dc = torch.nn.Parameter(sample_dc_new.requires_grad_(True))
+            else:
+                sample_actor._features_dc = torch.nn.Parameter(sample_actor._features_dc.data.cuda().requires_grad_(True))
+            
+            # 调整 _features_rest
+            if sample_actor._features_rest is None or sample_sh_rest_dim != actor_sh_rest_dim:
+                num_points = sample_actor._xyz.shape[0]
+                sample_rest_new = torch.zeros((num_points, actor_sh_rest_dim, 3), device='cuda')
+                sample_actor._features_rest = torch.nn.Parameter(sample_rest_new.requires_grad_(True))
+            else:
+                sample_actor._features_rest = torch.nn.Parameter(sample_actor._features_rest.data.cuda().requires_grad_(True))
+            
+            # 确保 sh_degree 一致
+            sample_actor.max_sh_degree = actor.max_sh_degree
+            sample_actor.active_sh_degree = actor.active_sh_degree
+            
+            # 确保其他参数在 CUDA 上
+            sample_actor._xyz = torch.nn.Parameter(sample_actor._xyz.data.cuda().requires_grad_(True))
+            sample_actor._rotation = torch.nn.Parameter(sample_actor._rotation.data.cuda().requires_grad_(True))
+            sample_actor._scaling = torch.nn.Parameter(sample_actor._scaling.data.cuda().requires_grad_(True))
+            sample_actor._opacity = torch.nn.Parameter(sample_actor._opacity.data.cuda().requires_grad_(True))
+            sample_actor._semantic = torch.nn.Parameter(sample_actor._semantic.data.cuda().requires_grad_(True))
+            
+            # 初始化训练参数（optimizer, 辅助张量等）
+            sample_actor.training_setup()
+            
+            # 确保所有辅助张量在 CUDA 上
+            sample_actor.max_radii2D = torch.zeros(sample_actor._xyz.shape[0], dtype=torch.float32, device='cuda')
+            sample_actor.xyz_gradient_accum = sample_actor.xyz_gradient_accum.cuda()
+            sample_actor.denom = sample_actor.denom.cuda()
+            
+            # 注册到 gaussians
+            setattr(self, sample_name, sample_actor)
+            self.model_name_id[sample_name] = self.models_num
+            self.obj_list.append(sample_name)
+            self.models_num += 1
+            
+            loaded_samples.append(sample_name)
+            print(f"  ✓ {sample_name}: 已加载并注册 ({sample_actor._xyz.shape[0]} 点)")
+        
+        if loaded_samples:
+            print(f"\n✓ 共加载 {len(loaded_samples)} 个 sample 对象")
+        else:
+            print("  未发现新的 sample 点云文件")
   
     def load_state_dict(self, state_dict, exclude_list=[]):
         for model_name in self.model_name_id.keys():
@@ -152,6 +293,9 @@ class StreetGaussianModel(nn.Module):
             
         if self.pose_correction is not None:
             self.pose_correction.load_state_dict(state_dict['pose_correction'])
+        
+        # 自动检测并加载 sample 点云（如果存在）
+        self._load_sample_objects_from_ply()
                             
     def save_state_dict(self, is_final, exclude_list=[]):
         state_dict = dict()
