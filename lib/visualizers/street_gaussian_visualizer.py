@@ -46,25 +46,26 @@ class StreetGaussianVisualizer():
         acc_bkgd = result['acc']
 
         
-        # ============ 创建difix3d
-        if cfg.data.isDifix:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            to_tensor = transforms.ToTensor()
-            # rgb
-            difix_rgb = difixPipe(difixPrompt, image=rgb, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-            difix_rgb = to_tensor(difix_rgb).to(device)
-            rgb = F.interpolate(difix_rgb.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
-            # rgb_obj
-            difix_rgb_obj = difixPipe(difixPrompt, image=rgb_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-            difix_rgb_obj = to_tensor(difix_rgb_obj).to(device)
-            rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
-        # ============
+        
         
         
         if self.save_image:
             if mode is None:
                 pass # vedio
             else:
+                # ============ 创建difix3d
+                if cfg.data.isDifix:
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    to_tensor = transforms.ToTensor()
+                    # rgb
+                    difix_rgb = difixPipe(difixPrompt, image=rgb, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+                    difix_rgb = to_tensor(difix_rgb).to(device)
+                    rgb = F.interpolate(difix_rgb.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
+                    # rgb_obj
+                    difix_rgb_obj = difixPipe(difixPrompt, image=rgb_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+                    difix_rgb_obj = to_tensor(difix_rgb_obj).to(device)
+                    rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
+                # ============
                 final_path = os.path.dirname(self.result_dir).replace('trajectory', f'{mode}/trajectory')
                 gt_dir = os.path.join(final_path,"gt")
                 render_dir = os.path.join(final_path,"render")

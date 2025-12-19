@@ -1,6 +1,6 @@
 task: waymo_full_exp
 source_path: ./data/waymo/002
-exp_name: waymo_train_002_exp_origin0
+exp_name: waymo_train_002_exp_origin00_debugsample
 
 data:
   split_test: 10
@@ -12,7 +12,7 @@ data:
   extent: 10
   use_colmap: true
   filter_colmap: true
-  isDifix: true
+  isDifix: false
   isTrellis: true
 
 model:
@@ -30,8 +30,8 @@ model:
 train:
   iterations: 30000
   test_iterations: [7000, 30000]
-  save_iterations: [30000, 29999]
-  checkpoint_iterations: [7000,16000, 23000,30000, 29999]
+  save_iterations: [16005,30000, 29999]
+  checkpoint_iterations: [7000,16000, 23000,30000, 29999,16005]
 
 optim:
   prune_box_interval: 100

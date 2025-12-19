@@ -82,9 +82,9 @@ def render_trajectory(custom_rotation=None, custom_translation=None, difixPipe=N
         cameras = train_cameras + test_cameras
         cameras = list(sorted(cameras, key=lambda x: x.id))
 
-        for idx, camera in enumerate(tqdm(cameras, desc="Rendering Trajectory")):
-            result = renderer.render_all(camera, gaussians,custom_rotation=custom_rotation,custom_translation=custom_translation)  #移动车辆
-            visualizer.visualize(result, camera, difixPipe = difixPipe, difixPrompt = difixPrompt)
+        # for idx, camera in enumerate(tqdm(cameras, desc="Rendering Trajectory")):
+        #     result = renderer.render_all(camera, gaussians,custom_rotation=custom_rotation,custom_translation=custom_translation)  #移动车辆
+        #     visualizer.visualize(result, camera, difixPipe = difixPipe, difixPrompt = difixPrompt)
    
         # save the train and test respectively
         for idx, train_camera in enumerate(tqdm(train_cameras, desc="Rendering train_cameras Trajectory")):

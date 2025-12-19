@@ -24,19 +24,16 @@ class StreetGaussianRenderer():
     ):
         
         # render all
-        # exclude_list1 = ['obj_177', 'obj_179', 'obj_181', 'obj_183', 'obj_187', 'obj_188', 'obj_189', 'obj_190', 'obj_193']
-        exclude_list1 = []
-        render_composition = self.render(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, exclude_list1, custom_rotation, custom_translation)
+        exclude_list3 = [name for name in pc.model_name_id.keys() if not name.endswith('_sample') and not name == 'background']
+        render_composition = self.render(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, exclude_list3, custom_rotation, custom_translation, [])
 
         # render background
-        exclude_list2 = []
-        render_background = self.render_background(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, exclude_list2)
+        render_background = self.render_background(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, [])
         
         # render object
-        # exclude_list3 = ['obj_003', 'obj_041', 'obj_053', 'obj_168', 'obj_177', 'obj_179', 'obj_181', 'obj_183', 'obj_187', 'obj_188', 'obj_189', 'obj_190', 'obj_193'] 
-        # exclude_list3 = ['obj_003',  'obj_053', 'obj_168', 'obj_177', 'obj_179', 'obj_181', 'obj_183', 'obj_187', 'obj_188', 'obj_189', 'obj_190', 'obj_193'] 
-        exclude_list3 = []
-        render_object = self.render_object(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, exclude_list3, custom_rotation, custom_translation)
+        # include_list3 = ["obj_004_sample"]
+        include_list3 = [name for name in pc.model_name_id.keys() if name.endswith('_sample')]
+        render_object = self.render_object(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, [], custom_rotation, custom_translation,include_list=include_list3)
         
         result = render_composition
         result['rgb_background'] = render_background['rgb']
@@ -130,9 +127,11 @@ class StreetGaussianRenderer():
         depth_threshold = 0.37,
         exclude_list = [],
         custom_rotation=None, 
-        custom_translation=None
+        custom_translation=None,
+        include_list = []
     ):   
-        include_list = list(set(pc.model_name_id.keys()) - set(exclude_list))
+        if len(include_list) == 0:
+            include_list = list(set(pc.model_name_id.keys()) - set(exclude_list))
                     
         # Step1: render foreground
         pc.set_visibility(include_list)

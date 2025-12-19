@@ -65,6 +65,7 @@ class StreetGaussianModel(nn.Module):
     
     def set_visibility(self, include_list):
         self.include_list = include_list # prefix
+        pass
 
     def get_visibility(self, model_name):
         if model_name == 'background':
@@ -108,14 +109,25 @@ class StreetGaussianModel(nn.Module):
 
             # 动态对象单独保存
             if model_name != 'background' and not model_name.endswith('_sample'):
-                # 检查是否有对应的 sample 对象
+                # 1. 始终保存原始 model_name 点云
+                plydata = PlyElement.describe(data, f'vertex')
+                obj_path = os.path.join(base_dir, f"{model_name}.ply")
+                PlyData([plydata]).write(obj_path)
+                print(f"  ✓ 保存原始点云: {model_name} ({len(data)} 点)")
+                
+                # 2. 检查是否有对应的 sample 对象
                 sample_name = f"{model_name}_sample"
                 if hasattr(self, sample_name) and sample_name in self.model_name_id:
-                    # 存在 sample 对象，合并保存
                     sample_model: GaussianModel = getattr(self, sample_name)
                     sample_data = sample_model.make_ply()
                     
-                    # 检查 dtype 是否一致并合并
+                    # 保存 sample 点云
+                    sample_plydata = PlyElement.describe(sample_data, f'vertex')
+                    sample_obj_path = os.path.join(base_dir, f"{sample_name}.ply")
+                    PlyData([sample_plydata]).write(sample_obj_path)
+                    print(f"  ✓ 保存 sample 点云: {sample_name} ({len(sample_data)} 点)")
+                    
+                    # 3. 合并保存
                     import numpy as np
                     if data.dtype == sample_data.dtype:
                         # dtype 一致，直接拼接
@@ -139,15 +151,10 @@ class StreetGaussianModel(nn.Module):
                                 print(f"    警告: sample 缺少字段 {field_name}，填充为 0")
                                 merged_data[field_name][len(data):] = 0
                     
-                    plydata = PlyElement.describe(merged_data, f'vertex')
-                    obj_path = os.path.join(base_dir, f"{model_name}.ply")
-                    PlyData([plydata]).write(obj_path)
-                    print(f"  ✓ 保存合并点云: {model_name} ({len(data)} 点) + {sample_name} ({len(sample_data)} 点) = {len(merged_data)} 点")
-                else:
-                    # 没有 sample 对象，单独保存原始点云
-                    plydata = PlyElement.describe(data, f'vertex')
-                    obj_path = os.path.join(base_dir, f"{model_name}.ply")
-                    PlyData([plydata]).write(obj_path)
+                    merged_plydata = PlyElement.describe(merged_data, f'vertex')
+                    merged_obj_path = os.path.join(base_dir, f"{model_name}_merged.ply")
+                    PlyData([merged_plydata]).write(merged_obj_path)
+                    print(f"  ✓ 保存合并点云: {model_name}_merged ({len(data)} + {len(sample_data)} = {len(merged_data)} 点)")
 
         PlyData(plydata_list).write(path)
         
@@ -198,10 +205,14 @@ class StreetGaussianModel(nn.Module):
             if not os.path.exists(sample_ply_path):
                 continue
             
-            # 检查是否已经注册
+            # 检查是否已经注册（比如从 checkpoint 加载）
             if hasattr(self, sample_name) and sample_name in self.model_name_id:
-                print(f"  - {sample_name}: 已注册，跳过")
+                print(f"  - {sample_name}: 已从 checkpoint 加载，跳过从 PLY 加载")
                 continue
+            
+            # 只有在 checkpoint 中没有 sample 时，才从 PLY 加载
+            # （这种情况通常只在训练模式下第一次遇到 sample 时发生）
+            print(f"  - {sample_name}: checkpoint中不存在，从 PLY 加载...")
             
             # 获取原始对象的元数据
             actor: GaussianModelActor = getattr(self, obj_name)
@@ -210,8 +221,9 @@ class StreetGaussianModel(nn.Module):
             # 创建新的 sample 对象
             sample_actor = GaussianModelActor(model_name=sample_name, obj_meta=obj_meta)
             
-            # 加载 PLY 文件
+            # 加载 PLY 文件（未对齐状态）
             sample_actor.load_ply(sample_ply_path)
+            print(f"    ✓ 从 PLY 加载完成（未对齐状态，需要在 train.py 中对齐）")
             
             # 设置 track_id（与原始对象相同）
             sample_actor.track_id = actor.track_id
@@ -223,24 +235,43 @@ class StreetGaussianModel(nn.Module):
             sample_fourier_dim = sample_actor._features_dc.shape[1]
             sample_sh_rest_dim = sample_actor._features_rest.shape[1] if sample_actor._features_rest is not None else 0
             
-            # 调整 _features_dc
+            # 调整 _features_dc（关键：正确处理 fourier_dim）
+            sample_dc = sample_actor._features_dc.data.cuda()  # [N, sample_fourier_dim, 3]
+            print(f"    原始 PLY 中的 _features_dc 形状: {sample_dc.shape}, 总和: {sample_dc.abs().sum().item():.2f}")
+            
             if sample_fourier_dim != actor_fourier_dim:
-                sample_dc = sample_actor._features_dc.data.cuda()
+                print(f"    调整 fourier_dim: {sample_fourier_dim} -> {actor_fourier_dim}")
                 if sample_fourier_dim < actor_fourier_dim:
-                    sample_dc_new = sample_dc[:, :1, :].expand(-1, actor_fourier_dim, -1).clone()
+                    # 【关键修复】只在第一个 fourier 通道放值，其他通道放0
+                    num_points = sample_dc.shape[0]
+                    sample_dc_new = torch.zeros((num_points, actor_fourier_dim, 3), device='cuda', dtype=torch.float)
+                    sample_dc_new[:, 0, :] = sample_dc[:, 0, :]  # 只复制第一个通道
+                    print(f"      (只在第0通道放值，其他通道为0)")
                 else:
+                    # 截断：只保留前 actor_fourier_dim 个通道
                     sample_dc_new = sample_dc[:, :actor_fourier_dim, :]
                 sample_actor._features_dc = torch.nn.Parameter(sample_dc_new.requires_grad_(True))
+                print(f"    调整后的 _features_dc 形状: {sample_actor._features_dc.shape}, 总和: {sample_actor._features_dc.abs().sum().item():.2f}")
             else:
-                sample_actor._features_dc = torch.nn.Parameter(sample_actor._features_dc.data.cuda().requires_grad_(True))
+                sample_actor._features_dc = torch.nn.Parameter(sample_dc.requires_grad_(True))
             
-            # 调整 _features_rest
-            if sample_actor._features_rest is None or sample_sh_rest_dim != actor_sh_rest_dim:
+            # 调整 _features_rest（关键：保留原始颜色信息，不要清零！）
+            if sample_actor._features_rest is not None:
+                sample_rest = sample_actor._features_rest.data.cuda()
+                if sample_sh_rest_dim != actor_sh_rest_dim:
+                    # 维度不匹配，需要调整（但保留原有数据）
+                    num_points = sample_actor._xyz.shape[0]
+                    sample_rest_new = torch.zeros((num_points, actor_sh_rest_dim, 3), device='cuda')
+                    copy_dim = min(sample_sh_rest_dim, actor_sh_rest_dim)
+                    sample_rest_new[:, :copy_dim, :] = sample_rest[:, :copy_dim, :]  # ← 保留原始数据
+                    sample_actor._features_rest = torch.nn.Parameter(sample_rest_new.requires_grad_(True))
+                else:
+                    sample_actor._features_rest = torch.nn.Parameter(sample_rest.requires_grad_(True))
+            else:
+                # 只有原本是None时才初始化为0
                 num_points = sample_actor._xyz.shape[0]
                 sample_rest_new = torch.zeros((num_points, actor_sh_rest_dim, 3), device='cuda')
                 sample_actor._features_rest = torch.nn.Parameter(sample_rest_new.requires_grad_(True))
-            else:
-                sample_actor._features_rest = torch.nn.Parameter(sample_actor._features_rest.data.cuda().requires_grad_(True))
             
             # 确保 sh_degree 一致
             sample_actor.max_sh_degree = actor.max_sh_degree
@@ -254,12 +285,16 @@ class StreetGaussianModel(nn.Module):
             sample_actor._semantic = torch.nn.Parameter(sample_actor._semantic.data.cuda().requires_grad_(True))
             
             # 初始化训练参数（optimizer, 辅助张量等）
+            # training_setup 会创建正确维度的辅助张量: xyz_gradient_accum [N,2], denom [N,1], max_radii2D [N]
             sample_actor.training_setup()
             
-            # 确保所有辅助张量在 CUDA 上
-            sample_actor.max_radii2D = torch.zeros(sample_actor._xyz.shape[0], dtype=torch.float32, device='cuda')
-            sample_actor.xyz_gradient_accum = sample_actor.xyz_gradient_accum.cuda()
-            sample_actor.denom = sample_actor.denom.cuda()
+            # 确保所有辅助张量在 CUDA 上（training_setup 应该已经创建了，只需确认）
+            if sample_actor.max_radii2D.device != torch.device('cuda'):
+                sample_actor.max_radii2D = sample_actor.max_radii2D.cuda()
+            if sample_actor.xyz_gradient_accum.device != torch.device('cuda'):
+                sample_actor.xyz_gradient_accum = sample_actor.xyz_gradient_accum.cuda()
+            if sample_actor.denom.device != torch.device('cuda'):
+                sample_actor.denom = sample_actor.denom.cuda()
             
             # 注册到 gaussians
             setattr(self, sample_name, sample_actor)
@@ -276,11 +311,129 @@ class StreetGaussianModel(nn.Module):
             print("  未发现新的 sample 点云文件")
   
     def load_state_dict(self, state_dict, exclude_list=[]):
+        # 【关键修复】先从 state_dict 中检测并注册 sample 对象
+        print("\n检查 state_dict 中的 sample 对象...")
+        for key in state_dict.keys():
+            if isinstance(key, str) and key.endswith('_sample') and key not in self.model_name_id.keys():
+                # state_dict 中有 sample，但 model_name_id 中没有，需要先注册
+                obj_name = key.replace('_sample', '')
+                if obj_name in self.model_name_id.keys():
+                    print(f"  检测到 {key}，正在注册...")
+                    actor: GaussianModelActor = getattr(self, obj_name)
+                    
+                    # 创建 sample 对象
+                    sample_actor = GaussianModelActor(model_name=key, obj_meta=actor.obj_meta)
+                    sample_actor.track_id = actor.track_id
+                    sample_actor.max_sh_degree = actor.max_sh_degree
+                    sample_actor.active_sh_degree = actor.active_sh_degree
+                    
+                    # 注册到 gaussians
+                    setattr(self, key, sample_actor)
+                    self.model_name_id[key] = self.models_num
+                    self.obj_list.append(key)
+                    self.models_num += 1
+                    print(f"  ✓ {key} 已注册，将从 checkpoint 加载参数")
+        
+        # 加载所有模型的参数（包括新注册的 sample）
         for model_name in self.model_name_id.keys():
             if startswith_any(model_name, exclude_list):
                 continue
+            if model_name not in state_dict:
+                print(f"  警告: {model_name} 不在 state_dict 中，跳过")
+                continue
+            
             model: GaussianModel = getattr(self, model_name)
             model.load_state_dict(state_dict[model_name])
+            
+            if model_name.endswith('_sample'):
+                print(f"  ✓ {model_name} 已从 checkpoint 加载（包括对齐后的位置）")
+                print(f"      checkpoint 中的颜色特征 - _features_dc: {model._features_dc.shape}, 总和: {model._features_dc.abs().sum().item():.2f}")
+                print(f"      checkpoint 中的颜色特征 - _features_rest: {model._features_rest.shape}, 总和: {model._features_rest.abs().sum().item():.2f}")
+                
+                # 【关键修复】总是从原始 PLY 文件重新加载颜色特征
+                # 原因：checkpoint 中的颜色可能在训练中被破坏，原始 PLY 才是最可靠的颜色来源
+                print(f"    正在从原始 PLY 文件恢复颜色特征...")
+                
+                # 获取原始 PLY 路径
+                input_ply_dir = os.path.join(cfg.model_path, 'input_ply')
+                sample_ply_path = os.path.join(input_ply_dir, f"{model_name}.ply")
+                
+                if os.path.exists(sample_ply_path):
+                    plydata = PlyData.read(sample_ply_path)
+                    
+                    # 获取原始对象的参数（sh_degree 和 fourier_dim）
+                    obj_name = model_name.replace('_sample', '')
+                    actor: GaussianModelActor = getattr(self, obj_name)
+                    target_sh_degree = actor.max_sh_degree
+                    target_fourier_dim = actor._features_dc.shape[1]  # 动态对象可能有多个 fourier channel
+                    
+                    print(f"      原始对象 {obj_name}: max_sh_degree={target_sh_degree}, fourier_dim={target_fourier_dim}")
+                    print(f"      原始对象 _features_dc 形状: {actor._features_dc.shape}")
+                    print(f"      原始对象 _features_rest 形状: {actor._features_rest.shape}")
+                    
+                    # 读取基础颜色特征 (DC component)
+                    # PLY 格式: [N个点] x [f_dc_0, f_dc_1, f_dc_2] (分别对应 RGB)
+                    features_dc = np.zeros((len(plydata['vertex']), 3, 1))  # [N, 3(RGB), 1(fourier_channel)]
+                    features_dc[:, 0, 0] = np.asarray(plydata['vertex']['f_dc_0'])  # R
+                    features_dc[:, 1, 0] = np.asarray(plydata['vertex']['f_dc_1'])  # G
+                    features_dc[:, 2, 0] = np.asarray(plydata['vertex']['f_dc_2'])  # B
+                    
+                    # 读取 rest 特征 (higher-order SH)
+                    extra_f_names = [p.name for p in plydata['vertex'].properties if p.name.startswith("f_rest_")]
+                    ply_sh_degree = int(np.sqrt(len(extra_f_names) // 3)) if extra_f_names else 0
+                    
+                    if ply_sh_degree > 0:
+                        features_rest = np.zeros((len(plydata['vertex']), len(extra_f_names)))
+                        for idx, attr_name in enumerate(extra_f_names):
+                            features_rest[:, idx] = np.asarray(plydata['vertex'][attr_name])
+                        features_rest = features_rest.reshape((len(plydata['vertex']), 3, -1))
+                    else:
+                        features_rest = np.zeros((len(plydata['vertex']), 3, 0))
+                    
+                    # 调整 sh_degree 维度
+                    ply_sh_rest_dim = features_rest.shape[2]
+                    target_sh_rest_dim = (target_sh_degree + 1) ** 2 - 1
+                    
+                    if ply_sh_rest_dim != target_sh_rest_dim:
+                        features_rest_new = np.zeros((len(plydata['vertex']), 3, target_sh_rest_dim))
+                        copy_dim = min(ply_sh_rest_dim, target_sh_rest_dim)
+                        features_rest_new[:, :, :copy_dim] = features_rest[:, :, :copy_dim]
+                        features_rest = features_rest_new
+                    
+                    # 转换为 torch 张量并调整维度顺序
+                    # features_dc: [N, 3, 1] -> transpose -> [N, 1, 3]
+                    features_dc_tensor = torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous()
+                    # features_rest: [N, 3, sh_rest_dim] -> transpose -> [N, sh_rest_dim, 3]
+                    features_rest_tensor = torch.tensor(features_rest, dtype=torch.float, device="cuda").transpose(1, 2).contiguous()
+                    
+                    # 调整 fourier_dim（只影响 _features_dc）
+                    if target_fourier_dim > 1:
+                        # 【关键修复】只在第一个 fourier 通道放值，其他通道放0
+                        # 原因：IDFT 权重的和不是1，如果复制到所有通道会导致颜色被放大
+                        # 例如：time=0 时，idft_base=[1,0,1,0,1]，如果 _features_dc=[v,v,v,v,v]
+                        # 结果会是 3v 而不是 v！
+                        num_points = features_dc_tensor.shape[0]
+                        features_dc_expanded = torch.zeros((num_points, target_fourier_dim, 3), device='cuda', dtype=torch.float)
+                        features_dc_expanded[:, 0, :] = features_dc_tensor[:, 0, :]  # 只在第一个通道放值
+                        features_dc_tensor = features_dc_expanded
+                        print(f"      扩展 fourier_dim: 1 -> {target_fourier_dim} (只在第0通道放值，其他通道为0)")
+                    
+                    # 更新模型的颜色特征
+                    # 根据模式决定是否需要梯度
+                    requires_grad = (cfg.mode == 'train')
+                    model._features_dc = torch.nn.Parameter(features_dc_tensor.requires_grad_(requires_grad))
+                    model._features_rest = torch.nn.Parameter(features_rest_tensor.requires_grad_(requires_grad))
+                    
+                    print(f"    ✓ 颜色特征已从原始 PLY 恢复 (requires_grad={requires_grad})")
+                    print(f"      _features_dc 形状: {model._features_dc.shape}, 总和: {model._features_dc.abs().sum().item():.2f}")
+                    print(f"      _features_rest 形状: {model._features_rest.shape}, 总和: {model._features_rest.abs().sum().item():.2f}")
+                    
+                    # 【关键】验证颜色特征确实被设置了
+                    dc_sample = model._features_dc[:min(3, model._features_dc.shape[0]), 0, :].cpu()
+                    print(f"      验证：前几个点的 DC 值 (第0个fourier通道): {dc_sample}")
+                else:
+                    print(f"    ⚠️  原始 PLY 文件不存在: {sample_ply_path}")
+                    print(f"    使用 checkpoint 中的颜色（可能不准确）")
         
         if self.actor_pose is not None:
             self.actor_pose.load_state_dict(state_dict['actor_pose'])
