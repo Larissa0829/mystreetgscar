@@ -260,15 +260,15 @@ def training():
 
         # difix3d loss: 目前想法是把difix3d嵌入 生成一个去除伪影的效果，来得到完整的车辆。（由于在渲染的时候会执行，所以训练的时候的优化有点微不足道）
         to_tensor = transforms.ToTensor()
-        # if data_args.isDifix and iteration % 2500 == 0:
-        #     # rgb
-        #     difix_rgb = to_tensor(difixPipe(difixPrompt, image=image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
-        #     difix_rgb = F.interpolate(difix_rgb.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
-        #     Ll1 = l1_loss(image, difix_rgb, mask)
-        #     scalar_dict['difix3d_loss'] = Ll1.item()
-        #     loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, difix_rgb, mask=mask))
+        if data_args.isDifix and iteration % 2500 == 0:
+            # rgb
+            difix_rgb = to_tensor(difixPipe(difixPrompt, image=image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
+            difix_rgb = F.interpolate(difix_rgb.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
+            Ll1 = l1_loss(image, difix_rgb, mask)
+            scalar_dict['difix3d_loss'] = Ll1.item()
+            loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, difix_rgb, mask=mask))
 
-        if data_args.isDifix and iteration >= 16001 and iteration % 10000 == 1:
+        if data_args.isDifix and iteration > int(training_args.iterations * 2 // 3)+1 and iteration % 100 == 1:
             # obj + 随机移动或旋转
             if gaussians.include_obj:
                 with torch.no_grad():
@@ -276,26 +276,31 @@ def training():
                     custom_translation = torch.empty(1).uniform_(0, 0)
                     # rgb_obj为随机变换之后的图像，作为render的结果
                     # ref_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,custom_rotation=None,custom_translation=None)["rgb"]
-                    rgb_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,custom_rotation=custom_rotation,custom_translation=custom_translation, include_list=["obj_004_sample"])["rgb"]
+                    rgb_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,custom_rotation=custom_rotation,custom_translation=custom_translation, include_list=[])["rgb"]
 
-                    # # difix_rgb_obj为difix3d处理之后的图像，作为临时的gt 两种方法，第二种可以输入参考ref
-                    # difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
-                    # # difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj, ref_image=ref_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
-                    # difix_rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
+                    # difix_rgb_obj为difix3d处理之后的图像，作为临时的gt 两种方法，第二种可以输入参考ref
+                    difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
+                    # difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj, ref_image=ref_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
+                    difix_rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
+                   
                     # lpips_loss = lpips(rgb_obj, difix_rgb_obj, net_type='alex')
                     # scalar_dict['difix3d_obj_loss'] = lpips_loss.item()
                     # loss += optim_args.lambda_lpips * lpips_loss.squeeze()
+
+                    Ll1 = l1_loss(rgb_obj, difix_rgb_obj, mask)
+                    scalar_dict['difix3d_obj_loss'] = Ll1.item()
+                    loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(rgb_obj, difix_rgb_obj, mask=mask))
                     
                     # 存储车辆部分的图像，方便查看
                     transform = T.ToPILImage()
                     image_pil = transform(rgb_obj.cpu())  # 确保 image 在 CPU 上
                     image_pil.save(f"rgb_obj_{iteration}_wodifix.png")
-                    # image_pil = transform(difix_rgb_obj.cpu())  # 确保 image 在 CPU 上
-                    # image_pil.save("difix_rgb_obj.png")
+                    image_pil = transform(difix_rgb_obj.cpu())  # 确保 image 在 CPU 上
+                    image_pil.save(f"rgb_obj_{iteration}_wdifix.png")
 
 
         # ================================ TRELLIS 单帧点云模板生成（作为独立对象）================================
-        if iteration == training_args.iterations-4 and gaussians.include_obj and data_args.isTrellis:
+        if iteration == int(training_args.iterations * 2 // 3)+1 and gaussians.include_obj and data_args.isTrellis:
             os.environ['SPCONV_ALGO'] = 'native'
             from PIL import Image
             from trellis.pipelines import TrellisImageTo3DPipeline
@@ -635,7 +640,7 @@ def training():
         iter_end.record()
                 
         is_save_images = True
-        if is_save_images and (iteration % 1000 == 5):
+        if is_save_images and (iteration % 1000 == 1):
             # row0: gt_image, image, depth
             # row1: acc, image_obj, acc_obj
             depth_colored, _ = visualize_depth_numpy(depth.detach().cpu().numpy().squeeze(0))
@@ -650,8 +655,11 @@ def training():
             row1 = torch.cat([acc, image_obj, acc_obj], dim=2)
             with torch.no_grad():
                 obj_name = gaussians.obj_list[0]
-                image_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,include_list=[obj_name],custom_rotation=90)["rgb"]
-                render_obj_sample = gaussians_renderer.render_object(viewpoint_cam, gaussians,include_list=[obj_name+"_sample"],custom_rotation=90)
+                origin_list = [name for name in gaussians.model_name_id.keys() if not name.endswith('_sample') and not name == 'background']
+                sample_list = [name for name in gaussians.model_name_id.keys() if name.endswith('_sample')]
+
+                image_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,exclude_list=[],include_list=origin_list,custom_rotation=90)["rgb"]
+                render_obj_sample = gaussians_renderer.render_object(viewpoint_cam, gaussians,exclude_list=[],include_list=sample_list,custom_rotation=90)
                 image_obj_sample, acc_obj_sample = render_obj_sample["rgb"],render_obj_sample["acc"]
             acc_obj_sample = acc_obj_sample.repeat(3, 1, 1)
             row2 = torch.cat([image_obj, image_obj_sample, acc_obj_sample], dim=2) # 原始车 + sample + sample_acc

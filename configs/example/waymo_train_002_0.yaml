@@ -12,7 +12,7 @@ data:
   extent: 10
   use_colmap: true
   filter_colmap: true
-  isDifix: false
+  isDifix: true
   isTrellis: true
 
 model:
@@ -30,8 +30,8 @@ model:
 train:
   iterations: 30000
   test_iterations: [7000, 30000]
-  save_iterations: [16005,30000, 29999]
-  checkpoint_iterations: [7000,16000, 23000,30000, 29999,16005]
+  save_iterations: [30000, 30000]
+  checkpoint_iterations: [7000,16000, 20000, 30000]
 
 optim:
   prune_box_interval: 100

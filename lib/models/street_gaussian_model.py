@@ -288,12 +288,25 @@ class StreetGaussianModel(nn.Module):
             # training_setup 会创建正确维度的辅助张量: xyz_gradient_accum [N,2], denom [N,1], max_radii2D [N]
             sample_actor.training_setup()
             
-            # 确保所有辅助张量在 CUDA 上（training_setup 应该已经创建了，只需确认）
-            if sample_actor.max_radii2D.device != torch.device('cuda'):
+            # 【关键】确保所有辅助张量形状正确且在 CUDA 上
+            num_points = sample_actor._xyz.shape[0]
+            
+            # 检查并修复 max_radii2D
+            if not hasattr(sample_actor, 'max_radii2D') or sample_actor.max_radii2D.shape[0] != num_points:
+                sample_actor.max_radii2D = torch.zeros(num_points, dtype=torch.float32, device='cuda')
+            elif sample_actor.max_radii2D.device != torch.device('cuda'):
                 sample_actor.max_radii2D = sample_actor.max_radii2D.cuda()
-            if sample_actor.xyz_gradient_accum.device != torch.device('cuda'):
+            
+            # 检查并修复 xyz_gradient_accum
+            if not hasattr(sample_actor, 'xyz_gradient_accum') or sample_actor.xyz_gradient_accum.shape[0] != num_points:
+                sample_actor.xyz_gradient_accum = torch.zeros((num_points, 2), dtype=torch.float32, device='cuda')
+            elif sample_actor.xyz_gradient_accum.device != torch.device('cuda'):
                 sample_actor.xyz_gradient_accum = sample_actor.xyz_gradient_accum.cuda()
-            if sample_actor.denom.device != torch.device('cuda'):
+            
+            # 检查并修复 denom
+            if not hasattr(sample_actor, 'denom') or sample_actor.denom.shape[0] != num_points:
+                sample_actor.denom = torch.zeros((num_points, 1), dtype=torch.float32, device='cuda')
+            elif sample_actor.denom.device != torch.device('cuda'):
                 sample_actor.denom = sample_actor.denom.cuda()
             
             # 注册到 gaussians
@@ -312,12 +325,15 @@ class StreetGaussianModel(nn.Module):
   
     def load_state_dict(self, state_dict, exclude_list=[]):
         # 【关键修复】先从 state_dict 中检测并注册 sample 对象
-        print("\n检查 state_dict 中的 sample 对象...")
+        # 注意：只加载 checkpoint 中已存在的 sample 对象，不会自动从 PLY 文件加载
+        print("\n检查 checkpoint 中的 sample 对象...")
+        sample_keys_found = []
         for key in state_dict.keys():
             if isinstance(key, str) and key.endswith('_sample') and key not in self.model_name_id.keys():
                 # state_dict 中有 sample，但 model_name_id 中没有，需要先注册
                 obj_name = key.replace('_sample', '')
                 if obj_name in self.model_name_id.keys():
+                    sample_keys_found.append(key)
                     print(f"  检测到 {key}，正在注册...")
                     actor: GaussianModelActor = getattr(self, obj_name)
                     
@@ -327,12 +343,21 @@ class StreetGaussianModel(nn.Module):
                     sample_actor.max_sh_degree = actor.max_sh_degree
                     sample_actor.active_sh_degree = actor.active_sh_degree
                     
+                    # 【关键】初始化训练辅助张量（在加载 state_dict 之前）
+                    # 这些张量会在加载 state_dict 时被覆盖，但如果 state_dict 中没有，至少有一个正确的形状
+                    sample_actor.training_setup()
+                    
                     # 注册到 gaussians
                     setattr(self, key, sample_actor)
                     self.model_name_id[key] = self.models_num
                     self.obj_list.append(key)
                     self.models_num += 1
                     print(f"  ✓ {key} 已注册，将从 checkpoint 加载参数")
+        
+        if not sample_keys_found:
+            print("  未发现 sample 对象（checkpoint 中不存在）")
+        else:
+            print(f"  共发现 {len(sample_keys_found)} 个 sample 对象")
         
         # 加载所有模型的参数（包括新注册的 sample）
         for model_name in self.model_name_id.keys():
@@ -447,8 +472,31 @@ class StreetGaussianModel(nn.Module):
         if self.pose_correction is not None:
             self.pose_correction.load_state_dict(state_dict['pose_correction'])
         
-        # 自动检测并加载 sample 点云（如果存在）
-        self._load_sample_objects_from_ply()
+        # 【修改】不再自动从 PLY 文件加载 sample 对象
+        # 只加载 checkpoint 中已经存在的 sample 对象
+        # 如果需要从 PLY 加载，应该在 train.py 的 iteration 16001 中手动处理
+        
+        # 【关键修复】确保所有 sample 对象的辅助张量形状正确
+        # 防止在 set_max_radii2D 时出现形状不匹配的错误
+        for model_name in self.model_name_id.keys():
+            if model_name.endswith('_sample'):
+                model: GaussianModelActor = getattr(self, model_name)
+                num_points = model._xyz.shape[0]
+                
+                # 检查并修复 max_radii2D
+                if not hasattr(model, 'max_radii2D') or model.max_radii2D.shape[0] != num_points:
+                    model.max_radii2D = torch.zeros(num_points, dtype=torch.float32, device='cuda')
+                    print(f"  ✓ {model_name}: 修复 max_radii2D 形状 -> [{num_points}]")
+                
+                # 检查并修复 xyz_gradient_accum
+                if not hasattr(model, 'xyz_gradient_accum') or model.xyz_gradient_accum.shape[0] != num_points:
+                    model.xyz_gradient_accum = torch.zeros((num_points, 2), dtype=torch.float32, device='cuda')
+                    print(f"  ✓ {model_name}: 修复 xyz_gradient_accum 形状 -> [{num_points}, 2]")
+                
+                # 检查并修复 denom
+                if not hasattr(model, 'denom') or model.denom.shape[0] != num_points:
+                    model.denom = torch.zeros((num_points, 1), dtype=torch.float32, device='cuda')
+                    print(f"  ✓ {model_name}: 修复 denom 形状 -> [{num_points}, 1]")
                             
     def save_state_dict(self, is_final, exclude_list=[]):
         state_dict = dict()
@@ -574,6 +622,20 @@ class StreetGaussianModel(nn.Module):
             num_gaussians_obj = getattr(self, obj_name).get_xyz.shape[0]
             self.graph_gaussian_range[obj_name] = [idx, idx+num_gaussians_obj-1]
             idx += num_gaussians_obj
+        
+        # 【关键修复】确保所有在 include_list 中的 sample 对象也被添加到 graph_gaussian_range
+        # 即使它们不在当前时间戳的可见范围内，也要包含它们，否则 set_max_radii2D 会报错
+        if self.include_obj and hasattr(self, 'include_list'):
+            for model_name in self.model_name_id.keys():
+                if model_name.endswith('_sample') and model_name not in self.graph_gaussian_range:
+                    if self.get_visibility(model_name):
+                        num_gaussians_obj = getattr(self, model_name).get_xyz.shape[0]
+                        self.graph_gaussian_range[model_name] = [idx, idx+num_gaussians_obj-1]
+                        self.num_gaussians += num_gaussians_obj
+                        idx += num_gaussians_obj
+                        # 也添加到 graph_obj_list，以便后续代码正确处理
+                        if model_name not in self.graph_obj_list:
+                            self.graph_obj_list.append(model_name)
 
         if len(self.graph_obj_list) > 0:
             self.obj_rots = []
@@ -890,8 +952,19 @@ class StreetGaussianModel(nn.Module):
             end += 1
             visibility_model = visibility_filter[start:end]
             max_radii2D_model = radii[start:end]
-            model.max_radii2D[visibility_model] = torch.max(
-                model.max_radii2D[visibility_model], max_radii2D_model[visibility_model])
+            
+            # 【关键修复】确保 visibility_model 的形状与 model.max_radii2D 匹配
+            # 如果 visibility_model 为空或形状不匹配，跳过更新
+            if visibility_model.numel() == 0:
+                continue
+            if visibility_model.shape[0] != model.max_radii2D.shape[0]:
+                print(f"警告: {model_name} 的 visibility_model 形状 {visibility_model.shape} 与 max_radii2D 形状 {model.max_radii2D.shape} 不匹配，跳过更新")
+                continue
+            
+            # 只有当有可见的点时才更新
+            if visibility_model.any():
+                model.max_radii2D[visibility_model] = torch.max(
+                    model.max_radii2D[visibility_model], max_radii2D_model[visibility_model])
         
     def add_densification_stats(self, viewspace_point_tensor, visibility_filter, pixels):
         viewspace_point_tensor_grad = viewspace_point_tensor.grad
@@ -903,9 +976,19 @@ class StreetGaussianModel(nn.Module):
             visibility_model = visibility_filter[start:end]
             pixels_cp = pixels[start:end]
             viewspace_point_tensor_grad_model = viewspace_point_tensor_grad[start:end]
-            model.xyz_gradient_accum[visibility_model, 0:1] += torch.norm(viewspace_point_tensor_grad_model[visibility_model, :2], dim=-1, keepdim=True)* pixels_cp[visibility_model]
-            model.xyz_gradient_accum[visibility_model, 1:2] += torch.norm(viewspace_point_tensor_grad_model[visibility_model, 2:], dim=-1, keepdim=True)* pixels_cp[visibility_model]
-            model.denom[visibility_model] += pixels_cp[visibility_model]
+            
+            # 【关键修复】确保 visibility_model 的形状与模型的张量匹配
+            if visibility_model.numel() == 0:
+                continue
+            if visibility_model.shape[0] != model.xyz_gradient_accum.shape[0]:
+                print(f"警告: {model_name} 的 visibility_model 形状 {visibility_model.shape} 与 xyz_gradient_accum 形状 {model.xyz_gradient_accum.shape[0]} 不匹配，跳过更新")
+                continue
+            
+            # 只有当有可见的点时才更新
+            if visibility_model.any():
+                model.xyz_gradient_accum[visibility_model, 0:1] += torch.norm(viewspace_point_tensor_grad_model[visibility_model, :2], dim=-1, keepdim=True)* pixels_cp[visibility_model]
+                model.xyz_gradient_accum[visibility_model, 1:2] += torch.norm(viewspace_point_tensor_grad_model[visibility_model, 2:], dim=-1, keepdim=True)* pixels_cp[visibility_model]
+                model.denom[visibility_model] += pixels_cp[visibility_model]
         
     def densify_and_prune(self, max_grad, min_opacity, prune_big_points, exclude_list=[]):
         scalars = None
