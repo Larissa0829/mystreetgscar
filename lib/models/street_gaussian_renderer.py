@@ -24,7 +24,8 @@ class StreetGaussianRenderer():
     ):
         
         # render all
-        exclude_list3 = [name for name in pc.model_name_id.keys() if not name.endswith('_sample') and not name == 'background']
+        # exclude_list3 = [name for name in pc.model_name_id.keys() if not name.endswith('_sample') and not name == 'background'] #原始obj
+        exclude_list3 =[]
         render_composition = self.render(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, exclude_list3, custom_rotation, custom_translation, [])
 
         # render background
@@ -32,8 +33,10 @@ class StreetGaussianRenderer():
         
         # render object
         # include_list3 = ["obj_004_sample"]
-        include_list3 = [name for name in pc.model_name_id.keys() if name.endswith('_sample')]
-        render_object = self.render_object(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, [], custom_rotation, custom_translation,include_list=include_list3)
+        # include_list3 = []
+        # include_list3 = [name for name in pc.model_name_id.keys() if not name.endswith('_sample') and not name == 'background'] #不要原始obj
+        include_list3 = [name for name in pc.model_name_id.keys() if name.endswith('_sample')] #sample
+        render_object = self.render_object(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, exclude_list3, custom_rotation, custom_translation,include_list3)
         
         result = render_composition
         result['rgb_background'] = render_background['rgb']

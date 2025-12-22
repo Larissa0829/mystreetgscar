@@ -204,6 +204,9 @@ class GaussianModelActor(GaussianModel):
         self.tensor_dict = dict()  
             
     def densify_and_prune(self, max_grad, min_opacity, prune_big_points):
+        # 【显存优化】对于sample点云，禁用densify（clone/split），只允许prune
+        is_sample = self.model_name.endswith('_sample')
+        
         if not (getattr(self, 'random_initialization', False) or self.deformable):
             max_grad = cfg.optim.get('densify_grad_threshold_obj', max_grad)
             if cfg.optim.get('densify_grad_abs_obj', False):
@@ -216,12 +219,15 @@ class GaussianModelActor(GaussianModel):
         grads[grads.isnan()] = 0.0
 
         # Clone and Split
-        # extent = self.get_extent()
-        extent = self.extent
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        # 【显存优化】sample点云不进行densify，避免点云数量增长
+        if not is_sample:
+            # extent = self.get_extent()
+            extent = self.extent
+            self.densify_and_clone(grads, max_grad, extent)
+            self.densify_and_split(grads, max_grad, extent)
 
         # Prune points below opacity
+        # sample点云允许prune，删除低透明度点以控制点云数量
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         
         if prune_big_points:

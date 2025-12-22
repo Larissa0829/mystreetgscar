@@ -44,17 +44,13 @@ class StreetGaussianVisualizer():
         rgb_obj = result['rgb_object']
         acc_obj = result['acc_object']
         acc_bkgd = result['acc']
-
-        
-        
-        
         
         if self.save_image:
             if mode is None:
                 pass # vedio
             else:
                 # ============ 创建difix3d
-                if cfg.data.isDifix:
+                if False: #cfg.data.isDifix:
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     to_tensor = transforms.ToTensor()
                     # rgb

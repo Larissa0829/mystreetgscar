@@ -268,35 +268,49 @@ def training():
             scalar_dict['difix3d_loss'] = Ll1.item()
             loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, difix_rgb, mask=mask))
 
-        if data_args.isDifix and iteration > int(training_args.iterations * 2 // 3)+1 and iteration % 100 == 1:
+        if data_args.isDifix and iteration > int(training_args.iterations * 2 // 3)+1 and iteration % 250 == 1:
             # obj + 随机移动或旋转
             if gaussians.include_obj:
+                # 生成随机旋转和平移
                 with torch.no_grad():
                     custom_rotation = torch.tensor([torch.randint(90, 91, (1,)).item()], dtype=torch.float32) * torch.pi / 180
                     custom_translation = torch.empty(1).uniform_(0, 0)
-                    # rgb_obj为随机变换之后的图像，作为render的结果
-                    # ref_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,custom_rotation=None,custom_translation=None)["rgb"]
-                    rgb_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,custom_rotation=custom_rotation,custom_translation=custom_translation, include_list=[])["rgb"]
-
-                    # difix_rgb_obj为difix3d处理之后的图像，作为临时的gt 两种方法，第二种可以输入参考ref
-                    difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
-                    # difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj, ref_image=ref_obj, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
+                
+                # 构建包含原始对象和对应sample对象的列表
+                origin_list = [name for name in gaussians.obj_list if not name.endswith('_sample') and name not in ['sky', 'background']]
+                sample_list = []
+                for obj_name in origin_list:
+                    sample_name = f"{obj_name}_sample"
+                    if hasattr(gaussians, sample_name) and sample_name in gaussians.model_name_id:
+                        sample_list.append(sample_name)
+                
+                # 合并原始对象和sample对象进行渲染（sample点云补充原始对象）
+                include_obj_list = origin_list + sample_list
+                
+                # 渲染：rgb_obj为随机变换之后的图像（包含原始对象+sample点云补充）
+                # 注意：需要在有梯度的情况下渲染，以便后续loss可以反向传播优化gaussians参数
+                rgb_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, custom_translation=custom_translation, include_list=include_obj_list)["rgb"]
+                
+                # difix_rgb_obj为difix3d处理之后的图像，作为临时的gt
+                # difixPipe推理可以放在no_grad下（因为它是固定模型，不需要梯度）
+                with torch.no_grad():
+                    # 使用difix3d方法：可以输入参考ref（如果需要，可以取消注释下面一行并注释当前行）
+                    difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj.detach(), num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
+                    # ref_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=None, custom_translation=None, include_list=origin_list)["rgb"]
+                    # difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj.detach(), ref_image=ref_obj.detach(), num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
                     difix_rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
-                   
-                    # lpips_loss = lpips(rgb_obj, difix_rgb_obj, net_type='alex')
-                    # scalar_dict['difix3d_obj_loss'] = lpips_loss.item()
-                    # loss += optim_args.lambda_lpips * lpips_loss.squeeze()
-
-                    Ll1 = l1_loss(rgb_obj, difix_rgb_obj, mask)
-                    scalar_dict['difix3d_obj_loss'] = Ll1.item()
-                    loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(rgb_obj, difix_rgb_obj, mask=mask))
                     
                     # 存储车辆部分的图像，方便查看
                     transform = T.ToPILImage()
-                    image_pil = transform(rgb_obj.cpu())  # 确保 image 在 CPU 上
+                    image_pil = transform(rgb_obj.detach().cpu().clamp(0, 1))  # 确保 image 在 CPU 上
                     image_pil.save(f"rgb_obj_{iteration}_wodifix.png")
-                    image_pil = transform(difix_rgb_obj.cpu())  # 确保 image 在 CPU 上
+                    image_pil = transform(difix_rgb_obj.detach().cpu().clamp(0, 1))  # 确保 image 在 CPU 上
                     image_pil.save(f"rgb_obj_{iteration}_wdifix.png")
+                
+                # 计算loss（需要在有梯度的情况下计算，以便反向传播优化gaussians参数）
+                Ll1 = l1_loss(rgb_obj, difix_rgb_obj, mask)
+                scalar_dict['difix3d_obj_loss'] = Ll1.item()
+                loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(rgb_obj, difix_rgb_obj, mask=mask))
 
 
         # ================================ TRELLIS 单帧点云模板生成（作为独立对象）================================
@@ -695,7 +709,10 @@ def training():
 
             # Densification
             if iteration < optim_args.densify_until_iter:
-                gaussians.set_visibility(include_list=list(set(gaussians.model_name_id.keys()) - set(['sky'])))
+                # 【显存优化】排除sample点云，它们不参与densification相关操作
+                include_list = [name for name in gaussians.model_name_id.keys() 
+                               if not name.endswith('_sample') and name != 'sky']
+                gaussians.set_visibility(include_list=include_list)
                 gaussians.parse_camera(viewpoint_cam)   
                 gaussians.set_max_radii2D(radii, visibility_filter)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, render_pkg["pixels"])
@@ -704,10 +721,13 @@ def training():
 
                 if iteration > optim_args.densify_from_iter:
                     if iteration % optim_args.densification_interval == 0:
+                        # sample点云参与densify和prune，但使用更严格的阈值（在gaussian_model_actor中控制）
+                        exclude_list = []  # 不再排除sample点云，让它们参与densify和prune
                         scalars, tensors = gaussians.densify_and_prune(
                             max_grad=optim_args.densify_grad_threshold,
                             min_opacity=optim_args.min_opacity,
                             prune_big_points=prune_big_points,
+                            exclude_list=exclude_list,
                         )
 
                         scalar_dict.update(scalars)
@@ -716,9 +736,12 @@ def training():
             # Reset opacity
             if iteration < optim_args.densify_until_iter:
                 if iteration % optim_args.opacity_reset_interval == 0:
-                    gaussians.reset_opacity()
+                    # 排除sample点云、sky和background，避免重置它们的透明度
+                    exclude_list = ['_sample']
+                    gaussians.reset_opacity(exclude_list=exclude_list)
                 if data_args.white_background and iteration == optim_args.densify_from_iter:
-                    gaussians.reset_opacity()
+                    exclude_list = ['_sample']
+                    gaussians.reset_opacity(exclude_list=exclude_list)
 
             training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer, optim_args)
 

@@ -947,6 +947,10 @@ class StreetGaussianModel(nn.Module):
         radii = radii.float()
         
         for model_name in self.graph_gaussian_range.keys():
+            # 【显存优化】排除sample点云，它们不参与densification
+            if model_name.endswith('_sample'):
+                continue
+                
             model: GaussianModel = getattr(self, model_name)
             start, end = self.graph_gaussian_range[model_name]
             end += 1
@@ -970,6 +974,10 @@ class StreetGaussianModel(nn.Module):
         viewspace_point_tensor_grad = viewspace_point_tensor.grad
 
         for model_name in self.graph_gaussian_range.keys():
+            # 【显存优化】排除sample点云，它们不参与densification，只参与渲染
+            if model_name.endswith('_sample'):
+                continue
+                
             model: GaussianModel = getattr(self, model_name)
             start, end = self.graph_gaussian_range[model_name]
             end += 1
@@ -994,7 +1002,13 @@ class StreetGaussianModel(nn.Module):
         scalars = None
         tensors = None
         for model_name in self.model_name_id.keys():
-            if startswith_any(model_name, exclude_list):
+            # 检查是否应该排除：支持startswith、endswith和精确匹配
+            should_exclude = False
+            for exclude_pattern in exclude_list:
+                if model_name.startswith(exclude_pattern) or model_name.endswith(exclude_pattern) or model_name == exclude_pattern:
+                    should_exclude = True
+                    break
+            if should_exclude:
                 continue
             model: GaussianModel = getattr(self, model_name)
 
@@ -1017,6 +1031,12 @@ class StreetGaussianModel(nn.Module):
     def reset_opacity(self, exclude_list=[]):
         for model_name in self.model_name_id.keys():
             model: GaussianModel = getattr(self, model_name)
-            if startswith_any(model_name, exclude_list):
+            # 检查是否应该排除：支持startswith、endswith和精确匹配
+            should_exclude = False
+            for exclude_pattern in exclude_list:
+                if model_name.startswith(exclude_pattern) or model_name.endswith(exclude_pattern) or model_name == exclude_pattern:
+                    should_exclude = True
+                    break
+            if should_exclude:
                 continue
             model.reset_opacity()
