@@ -546,7 +546,9 @@ def generate_dataparser_outputs(
             points_xyz_dict['bkgd'].append(points_lidar_xyz)
             points_rgb_dict['bkgd'].append(points_lidar_rgb)
             
-        initial_num_obj = 20000
+        # initial_num_obj = 20000
+        initial_num_obj = 200000000
+
 
         for k, v in points_xyz_dict.items():
             if len(v) == 0:

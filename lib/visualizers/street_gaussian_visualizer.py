@@ -50,7 +50,7 @@ class StreetGaussianVisualizer():
                 pass # vedio
             else:
                 # ============ 创建difix3d
-                if False: #cfg.data.isDifix:
+                if cfg.data.isDifix:#False: 
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     to_tensor = transforms.ToTensor()
                     # rgb

@@ -1,6 +1,6 @@
 task: waymo_full_exp
 source_path: ./data/waymo/002
-exp_name: waymo_train_002_exp_origin00_debugsample
+exp_name: waymo_train_002_exp_origin00_debugsample_wDifix_sample_constraint
 
 data:
   split_test: 10

@@ -28,6 +28,24 @@ class Scene:
             print("Creating gaussian model from point cloud")
             self.gaussians.create_from_pcd(point_cloud, scene_raidus)
             
+            # 在初始化时为原始对象点云添加对称性补全
+            if cfg.data.get('isSymmetry', False) and self.gaussians.include_obj:
+                print("\n" + "=" * 80)
+                print("初始化时为原始对象点云添加对称性补全")
+                print("=" * 80)
+                from lib.utils.symmetry_utils import apply_symmetry_to_all_objects
+                apply_symmetry_to_all_objects(
+                    self.gaussians,
+                    axis=1,  # Y轴对称（左右对称）
+                    mirror=True,  # 进行镜像补全
+                    add_loss=False  # 初始化时不计算损失
+                )
+                print("=" * 80)
+            
+            # 在初始化时加载并对齐sample点云对象
+            if hasattr(self.gaussians, 'load_and_align_sample_objects_at_init'):
+                self.gaussians.load_and_align_sample_objects_at_init()
+            
             train_cameras = self.getTrainCameras()
             self.train_cameras_id_to_index = dict()
             for i, train_camera in enumerate(train_cameras):

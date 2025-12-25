@@ -2,11 +2,11 @@ import os
 import torch
 from random import randint
 from lib.utils.loss_utils import l1_loss, l2_loss, psnr, ssim
-from lib.utils.img_utils import save_img_torch, visualize_depth_numpy
+from lib.utils.img_utils import save_img_torch, visualize_depth_numpy, draw_3d_box_on_img
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer
 from lib.models.street_gaussian_model import StreetGaussianModel
 from lib.models.gaussian_model_actor import GaussianModelActor
-from lib.utils.general_utils import safe_state
+from lib.utils.general_utils import safe_state, quaternion_to_matrix, draw_bbox_for_objects
 from lib.utils.camera_utils import Camera
 from lib.utils.cfg_utils import save_cfg
 from lib.utils.lpipsPyTorch import lpips
@@ -22,6 +22,7 @@ from torchvision import transforms
 import torch.nn.functional as F
 import torchvision.transforms as T
 import numpy as np
+import cv2
 
 
 # 第四章 补全车辆 引入difix3d
@@ -268,15 +269,15 @@ def training():
             scalar_dict['difix3d_loss'] = Ll1.item()
             loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, difix_rgb, mask=mask))
 
-        if data_args.isDifix and iteration > int(training_args.iterations * 2 // 3)+1 and iteration % 250 == 1:
+        if data_args.isDifix and iteration % 250 == 1:
             # obj + 随机移动或旋转
             if gaussians.include_obj:
-                # 生成随机旋转和平移
+                # 1. 扩大随机旋转范围到 0-360 度，确保全方位观测监督
                 with torch.no_grad():
-                    custom_rotation = torch.tensor([torch.randint(90, 91, (1,)).item()], dtype=torch.float32) * torch.pi / 180
-                    custom_translation = torch.empty(1).uniform_(0, 0)
+                    custom_rotation = torch.tensor([torch.randint(0, 360, (1,)).item()], dtype=torch.float32) * torch.pi / 180
+                    custom_translation = torch.zeros(1).to(device) # 可以根据需要添加位移
                 
-                # 构建包含原始对象和对应sample对象的列表
+                # 2. 构建包含原始对象和对应sample对象的列表
                 origin_list = [name for name in gaussians.obj_list if not name.endswith('_sample') and name not in ['sky', 'background']]
                 sample_list = []
                 for obj_name in origin_list:
@@ -287,365 +288,50 @@ def training():
                 # 合并原始对象和sample对象进行渲染（sample点云补充原始对象）
                 include_obj_list = origin_list + sample_list
                 
-                # 渲染：rgb_obj为随机变换之后的图像（包含原始对象+sample点云补充）
-                # 注意：需要在有梯度的情况下渲染，以便后续loss可以反向传播优化gaussians参数
-                rgb_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, custom_translation=custom_translation, include_list=include_obj_list)["rgb"]
+                # 3. 渲染：rgb_obj为随机变换之后的图像（包含原始对象+sample点云补充）
+                render_out = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, custom_translation=custom_translation, include_list=include_obj_list)
+                rgb_obj = render_out["rgb"]
                 
-                # difix_rgb_obj为difix3d处理之后的图像，作为临时的gt
-                # difixPipe推理可以放在no_grad下（因为它是固定模型，不需要梯度）
+                # 4. 利用 Difix3D 生成伪标签 (Pseudo-GT)
                 with torch.no_grad():
-                    # 使用difix3d方法：可以输入参考ref（如果需要，可以取消注释下面一行并注释当前行）
-                    difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj.detach(), num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
-                    # ref_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=None, custom_translation=None, include_list=origin_list)["rgb"]
-                    # difix_rgb_obj = to_tensor(difixPipe(difixPrompt, image=rgb_obj.detach(), ref_image=ref_obj.detach(), num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
+                    # 也可以尝试输入 ref_image 来增强一致性（如果 difixPipe 支持）
+                    difix_res = difixPipe(difixPrompt, image=rgb_obj.detach(), num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+                    difix_rgb_obj = to_tensor(difix_res).to(device)
                     difix_rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
                     
-                    # 存储车辆部分的图像，方便查看
-                    transform = T.ToPILImage()
-                    image_pil = transform(rgb_obj.detach().cpu().clamp(0, 1))  # 确保 image 在 CPU 上
-                    image_pil.save(f"rgb_obj_{iteration}_wodifix.png")
-                    image_pil = transform(difix_rgb_obj.detach().cpu().clamp(0, 1))  # 确保 image 在 CPU 上
-                    image_pil.save(f"rgb_obj_{iteration}_wdifix.png")
+                    # 存储图像用于 Debug
+                    if iteration % 500 == 1:
+                        save_dir = f"{cfg.model_path}/rotation_recording"
+                        os.makedirs(save_dir, exist_ok=True)
+                        transform = T.ToPILImage()
+                        transform(rgb_obj.detach().cpu().clamp(0, 1)).save(os.path.join(save_dir, f"rgb_obj_{iteration}_wodifix.png"))
+                        transform(difix_rgb_obj.detach().cpu().clamp(0, 1)).save(os.path.join(save_dir, f"rgb_obj_{iteration}_wdifix.png"))
                 
-                # 计算loss（需要在有梯度的情况下计算，以便反向传播优化gaussians参数）
-                Ll1 = l1_loss(rgb_obj, difix_rgb_obj, mask)
-                scalar_dict['difix3d_obj_loss'] = Ll1.item()
-                loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(rgb_obj, difix_rgb_obj, mask=mask))
+                # 5. 计算 RGB 监督损失
+                Ll1_difix = l1_loss(rgb_obj, difix_rgb_obj, mask)
+                Lssim_difix = 1.0 - ssim(rgb_obj, difix_rgb_obj, mask=mask)
+                scalar_dict['difix3d_obj_loss'] = Ll1_difix.item()
+                loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1_difix + optim_args.lambda_dssim * Lssim_difix
 
-
-        # ================================ TRELLIS 单帧点云模板生成（作为独立对象）================================
-        if iteration == int(training_args.iterations * 2 // 3)+1 and gaussians.include_obj and data_args.isTrellis:
-            os.environ['SPCONV_ALGO'] = 'native'
-            from PIL import Image
-            from trellis.pipelines import TrellisImageTo3DPipeline
-            from lib.utils.general_utils import matrix_to_quaternion, quaternion_raw_multiply
-            
-            print("=" * 80)
-            print("TRELLIS 点云模板生成与对齐")
-            print("=" * 80)
-            
-            ply_file_path = f"{cfg.model_path}/input_ply"
-            os.makedirs(ply_file_path, exist_ok=True)
-            
-            # ============ 阶段1: 生成点云 ============
-            print("\n[阶段1] 生成TRELLIS点云模板...")
-            trellis_pipeline = None
-            trellis_pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
-            trellis_pipeline.to(device)
-            
-            for obj_name in gaussians.obj_list:
-                # 跳过背景、天空和已经存在的 sample 对象
-                if obj_name in ['sky', 'background'] or obj_name.endswith('_sample'):
-                    continue
-                
-                sample_ply = f"{ply_file_path}/{obj_name}_sample.ply"
-                if os.path.exists(sample_ply):
-                    print(f"  ✓ {obj_name}_sample.ply 已存在，跳过生成")
-                    continue
-                
-                print(f"\n  生成 {obj_name} 的点云...")
-                
-                try:
-                    # 渲染对象图像
-                    with torch.no_grad():
-                        render_obj = gaussians_renderer.render_object(
-                            viewpoint_cam, gaussians, 
-                            custom_rotation=None, custom_translation=None,
-                            include_list=[obj_name]
-                        )
-                        rgb_obj = torch.clamp(render_obj["rgb"], 0, 1).permute(1, 2, 0)
-                        alpha = torch.clamp(render_obj['acc'], 0, 1).permute(1, 2, 0)
-                        rgba = torch.cat([rgb_obj, alpha], dim=-1)
-                        image_pil = Image.fromarray((rgba * 255).byte().cpu().numpy(), mode="RGBA")
-                        image_pil.save(f"{ply_file_path}/{obj_name}_input.png")
-                    
-                    # 运行TRELLIS生成点云
-                    outputs = trellis_pipeline.run(
-                        image_pil, seed=1, formats=['gaussian'],
-                        sparse_structure_sampler_params={"steps": 12, "cfg_strength": 7.5},
-                        slat_sampler_params={"steps": 12, "cfg_strength": 3}
-                    )
-                    obj_trellis_ply = outputs['gaussian'][0]
-                    
-                    # 添加高阶球谐系数
-                    if obj_trellis_ply._features_rest is None:
-                        num_points = obj_trellis_ply._features_dc.shape[0]
-                        obj_trellis_ply._features_rest = torch.zeros(
-                            (num_points, 15, 3),  # sh_degree=3: (3+1)^2-1=15
-                            dtype=obj_trellis_ply._features_dc.dtype,
-                            device=obj_trellis_ply._features_dc.device
-                        )
-                        obj_trellis_ply.sh_degree = obj_trellis_ply.active_sh_degree = 3
-                    
-                    obj_trellis_ply.save_ply(sample_ply)
-                    print(f"    ✓ 已保存: {sample_ply} ({num_points} 点)")
-                    
-                except Exception as e:
-                    print(f"    ⚠️ TRELLIS生成失败: {str(e)}")
-                    print(f"    跳过 {obj_name}，继续处理下一个对象")
-                    continue
-                
-                torch.cuda.empty_cache()
-            
-            if trellis_pipeline is not None:
-                del trellis_pipeline
-
-            torch.cuda.empty_cache()
-            
-
-            # ============ 阶段2: 创建并对齐sample对象 ============
-            print("\n[阶段2] 创建独立的sample对象并对齐...")
-            
-            # 坐标系转换矩阵（TRELLIS坐标系 → 目标坐标系）
-            transform_matrix = torch.tensor([
-                [0,  0, -1],  # X: -Z
-                [1,  0,  0],  # Y: +X
-                [0, -1,  0]   # Z: -Y
-            ], device='cuda', dtype=torch.float32)
-            transform_quat = matrix_to_quaternion(transform_matrix.unsqueeze(0)).squeeze(0)
-            
-            obj_list = gaussians.obj_list.copy()  # 避免迭代时修改列表
-            for obj_name in obj_list:
-                # 跳过背景、天空和已经存在的 sample 对象
-                if obj_name in ['sky', 'background'] or obj_name.endswith('_sample'):
-                    continue
-                
-                sample_name = f"{obj_name}_sample"
-                sample_ply = f"{ply_file_path}/{sample_name}.ply"
-                if not os.path.exists(sample_ply):
-                    continue
-                
-                actor: GaussianModelActor = getattr(gaussians, obj_name)
-                
-                # 检查 sample 对象是否已经注册（从 checkpoint 加载）
-                if hasattr(gaussians, sample_name) and sample_name in gaussians.model_name_id:
-                    print(f"\n  {sample_name} 已存在（从 checkpoint），重新对齐...")
-                    sample_actor = getattr(gaussians, sample_name)
-                    
-                    # 【关键修复】从原始 PLY 文件重新加载颜色特征（修复 checkpoint 中可能被破坏的颜色）
-                    print(f"    从原始 PLY 文件重新加载颜色特征...")
-                    from plyfile import PlyData
-                    plydata = PlyData.read(sample_ply)
-                    
-                    # 读取基础颜色特征 (DC component)
-                    features_dc = np.zeros((len(plydata['vertex']), 3, 1))
-                    features_dc[:, 0, 0] = np.asarray(plydata['vertex']['f_dc_0'])
-                    features_dc[:, 1, 0] = np.asarray(plydata['vertex']['f_dc_1'])
-                    features_dc[:, 2, 0] = np.asarray(plydata['vertex']['f_dc_2'])
-                    
-                    # 读取 rest 特征
-                    extra_f_names = [p.name for p in plydata['vertex'].properties if p.name.startswith("f_rest_")]
-                    if extra_f_names:
-                        features_rest = np.zeros((len(plydata['vertex']), len(extra_f_names)))
-                        for idx, attr_name in enumerate(extra_f_names):
-                            features_rest[:, idx] = np.asarray(plydata['vertex'][attr_name])
-                        features_rest = features_rest.reshape((len(plydata['vertex']), 3, -1))
-                    else:
-                        features_rest = np.zeros((len(plydata['vertex']), 3, 0))
-                    
-                    # 调整 sh_degree 维度以匹配原始对象
-                    target_sh_degree = actor.max_sh_degree
-                    ply_sh_rest_dim = features_rest.shape[2]
-                    target_sh_rest_dim = (target_sh_degree + 1) ** 2 - 1
-                    
-                    if ply_sh_rest_dim != target_sh_rest_dim:
-                        features_rest_new = np.zeros((len(plydata['vertex']), 3, target_sh_rest_dim))
-                        copy_dim = min(ply_sh_rest_dim, target_sh_rest_dim)
-                        features_rest_new[:, :, :copy_dim] = features_rest[:, :, :copy_dim]
-                        features_rest = features_rest_new
-                    
-                    # 转换为 torch 张量并调整维度
-                    features_dc_tensor = torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous()
-                    features_rest_tensor = torch.tensor(features_rest, dtype=torch.float, device="cuda").transpose(1, 2).contiguous()
-                    
-                    # 调整 fourier_dim（只影响 _features_dc）
-                    target_fourier_dim = actor._features_dc.shape[1]
-                    if target_fourier_dim > 1:
-                        # 【关键修复】只在第一个 fourier 通道放值，其他通道放0
-                        # 原因：IDFT 权重的和不是1，如果复制到所有通道会导致颜色被放大
-                        num_points = features_dc_tensor.shape[0]
-                        features_dc_expanded = torch.zeros((num_points, target_fourier_dim, 3), device='cuda', dtype=torch.float)
-                        features_dc_expanded[:, 0, :] = features_dc_tensor[:, 0, :]  # 只在第一个通道放值
-                        features_dc_tensor = features_dc_expanded
-                        print(f"    扩展 fourier_dim: 1 -> {target_fourier_dim} (只在第0通道放值)")
-                    
-                    # 更新 sample_actor 的颜色特征（暂存到 data 属性，后面会转为 Parameter）
-                    sample_actor._features_dc_data = features_dc_tensor
-                    sample_actor._features_rest_data = features_rest_tensor
-                    
-                    print(f"    ✓ 颜色特征已从 PLY 恢复: dc_sum={features_dc_tensor.abs().sum().item():.2f}, rest_sum={features_rest_tensor.abs().sum().item():.2f}")
-                    
-                    need_register = False
-                else:
-                    print(f"\n  创建 {sample_name}...")
-                    # 加载点云
-                    sample_actor = GaussianModelActor(model_name=sample_name, obj_meta=actor.obj_meta)
-                    sample_actor.load_ply(sample_ply)
-                    print(f"    点数: {sample_actor._xyz.shape[0]}")
-                    
-                    # 标记为新创建，后面会使用 load_ply 加载的颜色
-                    sample_actor._features_dc_data = None
-                    sample_actor._features_rest_data = None
-                    
-                    need_register = True
-                
-                with torch.no_grad():
-                    # 检查原始对象是否有点云
-                    obj_xyz = actor._xyz.data
-                    if obj_xyz.shape[0] == 0:
-                        print(f"    ⚠️  警告：原始对象 {obj_name} 没有点云（可能被完全修剪），跳过 sample 对齐")
-                        continue
-                    
-                    # 检查 sample 对象是否有点云
-                    template_xyz = sample_actor._xyz.data.cuda()
-                    if template_xyz.shape[0] == 0:
-                        print(f"    ⚠️  警告：sample 对象 {sample_name} 没有点云，跳过对齐")
-                        continue
-                    
-                    # 1. 坐标转换与缩放
-                    t_center = (template_xyz.min(dim=0)[0] + template_xyz.max(dim=0)[0]) / 2
-                    template_xyz_transformed = torch.matmul(template_xyz - t_center, transform_matrix.T)
-                    
-                    # 计算缩放因子（基于最大维度）
-                    t_scale = template_xyz_transformed.max(dim=0)[0] - template_xyz_transformed.min(dim=0)[0]
-                    obj_scale = obj_xyz.max(dim=0)[0] - obj_xyz.min(dim=0)[0]
-                    scale_factor = obj_scale.max() / (t_scale.max() + 1e-8)
-                    
-                    template_xyz_scaled = template_xyz_transformed * scale_factor
-                    print(f"    缩放因子: {scale_factor.item():.4f}")
-                    
-                    # 2. 更新所有参数
-                    sample_actor._xyz = torch.nn.Parameter(template_xyz_scaled.requires_grad_(True))
-                    sample_actor._rotation = torch.nn.Parameter(quaternion_raw_multiply(transform_quat.unsqueeze(0).expand(sample_actor._rotation.shape[0], -1),sample_actor._rotation.data.cuda()).requires_grad_(True))
-                    sample_actor._scaling = torch.nn.Parameter((sample_actor._scaling.data.cuda() + torch.log(scale_factor)).requires_grad_(True))
-                    sample_actor._opacity = torch.nn.Parameter(sample_actor._opacity.data.cuda().requires_grad_(True))
-                    sample_actor._semantic = torch.nn.Parameter(sample_actor._semantic.data.cuda().requires_grad_(True))
-                    
-                    # 3. 调整特征维度（使用从 PLY 重新加载的颜色特征）
-                    if hasattr(sample_actor, '_features_dc_data') and sample_actor._features_dc_data is not None:
-                        # 使用从 PLY 文件重新加载的颜色特征（checkpoint 中已存在的情况）
-                        sample_actor._features_dc = torch.nn.Parameter(sample_actor._features_dc_data.requires_grad_(True))
-                        sample_actor._features_rest = torch.nn.Parameter(sample_actor._features_rest_data.requires_grad_(True))
-                        print(f"    ✓ 使用从 PLY 重新加载的颜色特征")
-                    else:
-                        # 新创建的 sample，使用 load_ply 加载的颜色（需要调整 fourier_dim）
-                        sample_dc = sample_actor._features_dc.data.cuda()
-                        sample_fourier_dim = sample_dc.shape[1]
-                        actor_fourier_dim = actor._features_dc.shape[1]
-                        
-                        if sample_fourier_dim != actor_fourier_dim:
-                            print(f"    调整 fourier_dim: {sample_fourier_dim} -> {actor_fourier_dim}")
-                            if sample_fourier_dim < actor_fourier_dim:
-                                # 【关键修复】只在第一个 fourier 通道放值，其他通道放0
-                                num_points = sample_dc.shape[0]
-                                sample_dc_new = torch.zeros((num_points, actor_fourier_dim, 3), device='cuda', dtype=torch.float)
-                                sample_dc_new[:, 0, :] = sample_dc[:, 0, :]
-                                sample_dc = sample_dc_new
-                                print(f"      (只在第0通道放值，其他通道为0)")
-                            else:
-                                sample_dc = sample_dc[:, :actor_fourier_dim, :]
-                        
-                        sample_actor._features_dc = torch.nn.Parameter(sample_dc.requires_grad_(True))
-                        
-                        # _features_rest：保留原始信息
-                        if sample_actor._features_rest is not None:
-                            sample_rest = sample_actor._features_rest.data.cuda()
-                            sample_sh_rest_dim = sample_rest.shape[1]
-                            actor_sh_rest_dim = actor._features_rest.shape[1]
-                            
-                            if sample_sh_rest_dim != actor_sh_rest_dim:
-                                num_points = sample_actor._xyz.shape[0]
-                                sample_rest_new = torch.zeros((num_points, actor_sh_rest_dim, 3), device='cuda')
-                                copy_dim = min(sample_sh_rest_dim, actor_sh_rest_dim)
-                                sample_rest_new[:, :copy_dim, :] = sample_rest[:, :copy_dim, :]
-                                sample_rest = sample_rest_new
-                            
-                            sample_actor._features_rest = torch.nn.Parameter(sample_rest.requires_grad_(True))
-                        else:
-                            sample_actor._features_rest = torch.nn.Parameter(
-                                torch.zeros((sample_actor._xyz.shape[0], actor._features_rest.shape[1], 3), device='cuda').requires_grad_(True)
-                            )
-                        
-                        print(f"    ✓ 使用 load_ply 加载的颜色特征（已调整维度）")
-                    
-                    sample_actor.max_sh_degree = actor.max_sh_degree
-                    sample_actor.active_sh_degree = actor.active_sh_degree
-                
-                # 3.5. 【必须】设置时间戳，否则 parse_camera 会跳过 sample
-                sample_actor.track_id = actor.track_id
-                sample_actor.start_timestamp = actor.start_timestamp
-                sample_actor.end_timestamp = actor.end_timestamp
-                
-                # 4. 【必须】重新初始化 optimizer（因为参数对象变了）
-                # 否则 optimizer 会指向旧的参数，导致颜色不更新
-                sample_actor.training_setup()
-                # 注意：维度必须正确！xyz_gradient_accum: [N, 2], denom: [N, 1], max_radii2D: [N]
-                sample_actor.max_radii2D = torch.zeros(sample_actor._xyz.shape[0], dtype=torch.float32, device='cuda')
-                sample_actor.xyz_gradient_accum = torch.zeros((sample_actor._xyz.shape[0], 2), dtype=torch.float32, device='cuda')
-                sample_actor.denom = torch.zeros((sample_actor._xyz.shape[0], 1), dtype=torch.float32, device='cuda')
-                
-                # 5. 注册到场景（仅新创建的）
-                if need_register:
-                    setattr(gaussians, sample_name, sample_actor)
-                    gaussians.model_name_id[sample_name] = gaussians.models_num
-                    gaussians.obj_list.append(sample_name)
-                    gaussians.models_num += 1
-                    print(f"    ✓ 已注册，track_id={actor.track_id}（跟随{obj_name}）")
-                else:
-                    print(f"    ✓ 已重新对齐，track_id={actor.track_id}（跟随{obj_name}）")
-            
-            print("\n" + "=" * 80)
-            print(f"✓ 完成! 总对象数: {gaussians.models_num}")
-            print("=" * 80)
-            torch.cuda.empty_cache()
-            
-            # 测试sample是否创建成功
-            sample = gaussians_renderer.render_object(viewpoint_cam, gaussians,custom_rotation=None,custom_translation=None,include_list=["obj_004_sample"])["rgb"]
-            transform = T.ToPILImage()
-            sample = transform(sample.cpu())  # 确保 image 在 CPU 上
-            sample.save("sample.png")
-            
-            # # ============ 阶段3: 对原始动态对象应用对称性补全 ============
-            # print("\n[阶段3] 对原始动态对象应用自适应对称性补全...")
-            # from lib.utils.symmetry_utils import apply_symmetry_to_all_objects
-            
-            # # 对原始对象（非sample）应用自适应镜像补全
-            # # 每辆车自动判断哪一侧观测充分，然后镜像到另一侧
-            # apply_symmetry_to_all_objects(
-            #     gaussians, 
-            #     axis=1,  # Y轴对称（左右对称）
-            #     mirror=True,  # 进行自适应镜像补全
-            #     add_loss=False  # 此时不计算损失
-            # )
-            
-            # print("  ✓ 原始对象自适应对称性补全完成")
-            # print("=" * 80)
-            # torch.cuda.empty_cache()
-            
-            # 【必须】重新解析场景图，否则 densification 会因为 graph_gaussian_range 不包含 sample 而报错
-            print("\n重新解析场景图...")
-            gaussians.set_visibility(include_list=list(set(gaussians.model_name_id.keys()) - set(['sky'])))
-            gaussians.parse_camera(viewpoint_cam)
-            print("  ✓ 场景图已更新，sample 对象已包含")
-            torch.cuda.empty_cache()
-
-            
-            # 不 continue，让训练正常继续
-        # ================================
-        
-        # # 对称性损失（从 16002 迭代开始，只对 sample 对象）
-        # # 优化：每 5 次迭代计算一次，保证效果
-        # if iteration > 16001 and iteration % 5 == 0 and gaussians.include_obj and data_args.isTrellis:
+        # # 6. 利用 TRELLIS 的对称性先验（非常重要：解决非观测区域空洞）
+        # if iteration > 1000 and iteration % 5 == 0 and gaussians.include_obj:
         #     from lib.utils.symmetry_utils import apply_symmetry_to_sample_objects
+        #     # 对 sample 对象（即由 TRELLIS 初始化的部分）应用对称性损失
+        #     # axis=1 通常对应车辆的左右对称轴
         #     symmetry_loss = apply_symmetry_to_sample_objects(
         #         gaussians, 
-        #         axis=1,  # Y轴对称
-        #         mirror=False,  # 不镜像，只计算损失
-        #         add_loss=True  # 计算对称性损失
+        #         axis=1, 
+        #         mirror=False,  # 不主动镜像点，只计算 Loss
+        #         add_loss=True
         #     )
         #     if symmetry_loss is not None and symmetry_loss > 0:
+        #         # 这里的权重可以适当调大一点，以强制形状对齐
+        #         sym_weight = 0.1 
         #         scalar_dict['symmetry_loss'] = symmetry_loss.item()
-        #         loss += symmetry_loss
+        #         loss += symmetry_loss * sym_weight
+
+        # # 7. 几何形状正则化：防止 sample 高斯偏离 TRELLIS 提供的基础几何
+        # # 如果需要更强的约束，可以添加对 _sample 对象的位置正则化（此处保留逻辑接口）
             
         scalar_dict['loss'] = loss.item()
 
@@ -654,7 +340,7 @@ def training():
         iter_end.record()
                 
         is_save_images = True
-        if is_save_images and (iteration % 1000 == 1):
+        if is_save_images and (iteration % 500 == 1):
             # row0: gt_image, image, depth
             # row1: acc, image_obj, acc_obj
             depth_colored, _ = visualize_depth_numpy(depth.detach().cpu().numpy().squeeze(0))
@@ -673,10 +359,17 @@ def training():
                 sample_list = [name for name in gaussians.model_name_id.keys() if name.endswith('_sample')]
 
                 image_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians,exclude_list=[],include_list=origin_list,custom_rotation=90)["rgb"]
-                render_obj_sample = gaussians_renderer.render_object(viewpoint_cam, gaussians,exclude_list=[],include_list=sample_list,custom_rotation=90)
-                image_obj_sample, acc_obj_sample = render_obj_sample["rgb"],render_obj_sample["acc"]
-            acc_obj_sample = acc_obj_sample.repeat(3, 1, 1)
-            row2 = torch.cat([image_obj, image_obj_sample, acc_obj_sample], dim=2) # 原始车 + sample + sample_acc
+                render_obj_sample_90 = gaussians_renderer.render_object(viewpoint_cam, gaussians,exclude_list=[],include_list=sample_list,custom_rotation=90)["rgb"]
+                render_obj_sample_0 = gaussians_renderer.render_object(viewpoint_cam, gaussians,exclude_list=[],include_list=sample_list,custom_rotation=0)["rgb"]
+                
+                # # 在render_obj_sample_0上绘制原始车辆的bounding box
+                # # 需要重新设置visibility，让原始对象也可见，这样才能在graph_obj_list中找到它们
+                # gaussians.set_visibility(origin_list + sample_list)
+                # gaussians.parse_camera(viewpoint_cam, custom_rotation=None, custom_translation=None)
+                
+                # render_obj_sample_0 = draw_bbox_for_objects(gaussians,viewpoint_cam,render_obj_sample_0,origin_list)
+
+            row2 = torch.cat([image_obj, render_obj_sample_90, render_obj_sample_0], dim=2) # 原始车_90 + render_obj_sample_90 + render_obj_sample_0
 
             image_to_show = torch.cat([row0, row1, row2], dim=1)
             image_to_show = torch.clamp(image_to_show, 0.0, 1.0)
@@ -709,10 +402,7 @@ def training():
 
             # Densification
             if iteration < optim_args.densify_until_iter:
-                # 【显存优化】排除sample点云，它们不参与densification相关操作
-                include_list = [name for name in gaussians.model_name_id.keys() 
-                               if not name.endswith('_sample') and name != 'sky']
-                gaussians.set_visibility(include_list=include_list)
+                gaussians.set_visibility(include_list=list(set(gaussians.model_name_id.keys()) - set(['sky'])))
                 gaussians.parse_camera(viewpoint_cam)   
                 gaussians.set_max_radii2D(radii, visibility_filter)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, render_pkg["pixels"])
@@ -721,13 +411,10 @@ def training():
 
                 if iteration > optim_args.densify_from_iter:
                     if iteration % optim_args.densification_interval == 0:
-                        # sample点云参与densify和prune，但使用更严格的阈值（在gaussian_model_actor中控制）
-                        exclude_list = []  # 不再排除sample点云，让它们参与densify和prune
                         scalars, tensors = gaussians.densify_and_prune(
                             max_grad=optim_args.densify_grad_threshold,
                             min_opacity=optim_args.min_opacity,
                             prune_big_points=prune_big_points,
-                            exclude_list=exclude_list,
                         )
 
                         scalar_dict.update(scalars)
@@ -736,12 +423,9 @@ def training():
             # Reset opacity
             if iteration < optim_args.densify_until_iter:
                 if iteration % optim_args.opacity_reset_interval == 0:
-                    # 排除sample点云、sky和background，避免重置它们的透明度
-                    exclude_list = ['_sample']
-                    gaussians.reset_opacity(exclude_list=exclude_list)
+                    gaussians.reset_opacity()
                 if data_args.white_background and iteration == optim_args.densify_from_iter:
-                    exclude_list = ['_sample']
-                    gaussians.reset_opacity(exclude_list=exclude_list)
+                    gaussians.reset_opacity()
 
             training_report(tb_writer, iteration, scalar_dict, tensor_dict, training_args.test_iterations, scene, gaussians_renderer, optim_args)
 

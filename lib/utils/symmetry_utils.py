@@ -79,31 +79,41 @@ def mirror_gaussians(actor, axis=1, confidence_threshold=0.1, use_confidence=Tru
     
     if use_confidence:
         # 原始对象：基于置信度判断哪一侧观测更充分
-        grad_accum = actor.xyz_gradient_accum
-        
-        # 确保是一维张量
-        if grad_accum.dim() > 1:
-            grad_accum = grad_accum.squeeze()
-        if grad_accum.dim() > 1:
-            grad_accum = grad_accum.mean(dim=-1) if grad_accum.shape[-1] > 1 else grad_accum.squeeze(-1)
-        
-        confidence = grad_accum / (grad_accum.max() + 1e-8)
-        
-        # 找到高置信度（观测充分）的点
-        left_confident = left_mask & (confidence > confidence_threshold)
-        right_confident = right_mask & (confidence > confidence_threshold)
-        
-        # 自适应决定镜像方向（从观测多的一侧到观测少的一侧）
-        if left_confident.sum() > right_confident.sum():
-            # 左侧观测多，镜像到右侧
-            source_mask = left_confident
-            target_side = "右侧"
-            print(f"    检测: 左侧观测充分 ({left_confident.sum()} 点)，镜像到右侧")
+        # 检查 xyz_gradient_accum 是否已初始化（初始化时可能还没有）
+        if not hasattr(actor, 'xyz_gradient_accum') or actor.xyz_gradient_accum.numel() == 0:
+            # 初始化时还没有置信度信息，使用简单的点数判断
+            if left_mask.sum() > right_mask.sum():
+                source_mask = left_mask
+                print(f"    检测: 左侧点更多 ({left_mask.sum()} 点)，镜像到右侧（初始化模式）")
+            else:
+                source_mask = right_mask
+                print(f"    检测: 右侧点更多 ({right_mask.sum()} 点)，镜像到左侧（初始化模式）")
         else:
-            # 右侧观测多，镜像到左侧
-            source_mask = right_confident
-            target_side = "左侧"
-            print(f"    检测: 右侧观测充分 ({right_confident.sum()} 点)，镜像到左侧")
+            grad_accum = actor.xyz_gradient_accum
+            
+            # 确保是一维张量
+            if grad_accum.dim() > 1:
+                grad_accum = grad_accum.squeeze()
+            if grad_accum.dim() > 1:
+                grad_accum = grad_accum.mean(dim=-1) if grad_accum.shape[-1] > 1 else grad_accum.squeeze(-1)
+            
+            confidence = grad_accum / (grad_accum.max() + 1e-8)
+            
+            # 找到高置信度（观测充分）的点
+            left_confident = left_mask & (confidence > confidence_threshold)
+            right_confident = right_mask & (confidence > confidence_threshold)
+            
+            # 自适应决定镜像方向（从观测多的一侧到观测少的一侧）
+            if left_confident.sum() > right_confident.sum():
+                # 左侧观测多，镜像到右侧
+                source_mask = left_confident
+                target_side = "右侧"
+                print(f"    检测: 左侧观测充分 ({left_confident.sum()} 点)，镜像到右侧")
+            else:
+                # 右侧观测多，镜像到左侧
+                source_mask = right_confident
+                target_side = "左侧"
+                print(f"    检测: 右侧观测充分 ({right_confident.sum()} 点)，镜像到左侧")
     else:
         # sample 对象：简单的点数判断（不依赖置信度）
         if left_mask.sum() > right_mask.sum():
@@ -286,9 +296,19 @@ def apply_symmetry_to_all_objects(gaussians, axis=1, mirror=True, add_loss=False
         
         actor = getattr(gaussians, obj_name)
         
+        # 确保辅助张量已初始化（初始化时可能还没有）
+        if mirror:
+            num_points = actor._xyz.shape[0]
+            if not hasattr(actor, 'xyz_gradient_accum') or actor.xyz_gradient_accum.numel() == 0:
+                actor.xyz_gradient_accum = torch.zeros((num_points, 2), dtype=torch.float32, device='cuda')
+            if not hasattr(actor, 'denom') or actor.denom.numel() == 0:
+                actor.denom = torch.zeros((num_points, 1), dtype=torch.float32, device='cuda')
+            if not hasattr(actor, 'max_radii2D') or actor.max_radii2D.numel() == 0:
+                actor.max_radii2D = torch.zeros(num_points, dtype=torch.float32, device='cuda')
+        
         # 镜像补全
         if mirror:
-            tensors_dict = mirror_gaussians(actor, axis=axis)
+            tensors_dict = mirror_gaussians(actor, axis=axis, use_confidence=False)  # 初始化时使用点数判断
             if tensors_dict is not None:
                 num_new = tensors_dict['xyz'].shape[0]
                 actor.densification_postfix(tensors_dict)

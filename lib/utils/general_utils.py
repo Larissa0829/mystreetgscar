@@ -444,3 +444,131 @@ def euler_angles_to_matrix(euler_angles, convention="XYZ"):
         raise ValueError(f"Unsupported rotation convention: {convention}")
 
     return rotation_matrix
+
+    
+def draw_bbox_for_objects(gaussians,viewpoint_cam,render_img_tensor,origin_list,color_list=None,):
+    """
+    render_img_tensor: [3, H, W], RGB, torch tensor
+    """
+    img = (
+        render_img_tensor.clamp(0, 1)
+        .detach().cpu().numpy() * 255
+    ).astype(np.uint8)
+    img = img.transpose(1, 2, 0)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    H, W = img.shape[:2]
+    drawn = 0
+
+    for obj_name in origin_list:
+
+        if obj_name in ["sky", "background"]:
+            continue
+        if not hasattr(gaussians, obj_name):
+            continue
+
+        obj = getattr(gaussians, obj_name)
+
+        # ---------- timestamp ----------
+        t = viewpoint_cam.meta["timestamp"]
+        if t < obj.start_timestamp or t > obj.end_timestamp:
+            continue
+
+        # ======================================================
+        # 1. 使用obj_meta中的bounding box信息（而不是点云的）
+        # ======================================================
+        length, width, height = obj.obj_meta['length'], obj.obj_meta['width'], obj.obj_meta['height']
+        
+        # 在obj的局部坐标系中定义8个角点
+        # 坐标系：车头朝x正轴，向上为z正轴
+        # bbox中心在原点，尺寸为 [length, width, height] = [X, Y, Z]
+        half_length = length / 2.0
+        half_width = width / 2.0
+        half_height = height / 2.0
+        
+        corners_local = torch.tensor([
+            [-half_length, -half_width, -half_height],  # 0: 左下后
+            [ half_length, -half_width, -half_height],  # 1: 右下后
+            [-half_length,  half_width, -half_height],  # 2: 左上后
+            [ half_length,  half_width, -half_height],  # 3: 右上后
+            [-half_length, -half_width,  half_height],  # 4: 左下前
+            [ half_length, -half_width,  half_height],  # 5: 右下前
+            [-half_length,  half_width,  half_height],  # 6: 左上前
+            [ half_length,  half_width,  half_height],  # 7: 右上前
+        ], device='cuda', dtype=torch.float32)
+        
+        # ======================================================
+        # 2. 获取obj在世界坐标系中的pose（通过actor_pose）
+        # ======================================================
+        # 需要先设置visibility并parse_camera，才能获取obj_rots和obj_trans
+        if not hasattr(gaussians, 'graph_obj_list') or obj_name not in gaussians.graph_obj_list:
+            # 如果obj不在graph_obj_list中，需要重新设置visibility并parse_camera
+            gaussians.set_visibility(origin_list)
+            gaussians.parse_camera(viewpoint_cam, custom_rotation=None, custom_translation=None)
+        
+        if obj_name not in gaussians.graph_obj_list:
+            continue
+        
+        # 获取obj在graph_gaussian_range中的起始索引
+        if obj_name not in gaussians.graph_gaussian_range:
+            continue
+        
+        start_idx = gaussians.graph_gaussian_range[obj_name][0]
+        
+        # 获取parse_camera中已经计算好的旋转和平移（已考虑ego pose）
+        obj_rot = gaussians.obj_rots[start_idx]  # [4] 四元数
+        obj_trans = gaussians.obj_trans[start_idx]  # [3] 平移向量
+        
+        # ======================================================
+        # 3. 将局部坐标转换为世界坐标
+        # ======================================================
+        # 将旋转四元数转换为旋转矩阵
+        if obj_rot.dim() == 1:
+            obj_rot = obj_rot.unsqueeze(0)  # [1, 4]
+        rot_matrix = quaternion_to_matrix(obj_rot).squeeze(0)  # [3, 3]
+        
+        # 将局部坐标转换为世界坐标
+        corners_world = (rot_matrix @ corners_local.T).T + obj_trans.unsqueeze(0)  # [8, 3]
+
+        # ======================================================
+        # 6. World → Camera
+        # ======================================================
+        ones = torch.ones((8, 1), device=xyz.device)
+        corners_h = torch.cat([corners_world, ones], dim=1)
+
+        cam = (viewpoint_cam.world_view_transform @ corners_h.T).T
+        if not (cam[:, 2] < -1e-3).any():
+            continue
+
+        # ======================================================
+        # 7. Projection
+        # ======================================================
+        proj = (viewpoint_cam.full_proj_transform @ corners_h.T).T
+        xy = proj[:, :2] / proj[:, 3:4]
+
+        u = (xy[:, 0] + 1) * 0.5 * W
+        v = (1 - xy[:, 1]) * 0.5 * H
+
+        pts = torch.stack([u, v], dim=1).cpu().numpy().astype(np.int32)
+        pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
+
+        # ======================================================
+        # 8. Draw
+        # ======================================================
+        edges = [
+            (0,1),(1,2),(2,3),(3,0),
+            (4,5),(5,6),(6,7),(7,4),
+            (0,4),(1,5),(2,6),(3,7),
+        ]
+
+        for i, j in edges:
+            cv2.line(img, tuple(pts[i]), tuple(pts[j]), (0,255,0), 2)
+
+        drawn += 1
+
+    print(f"[BBox] drawn {drawn}")
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = torch.from_numpy(img).permute(2,0,1).float().cuda() / 255.0
+    return img

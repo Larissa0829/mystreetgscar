@@ -33,9 +33,9 @@ class StreetGaussianRenderer():
         
         # render object
         # include_list3 = ["obj_004_sample"]
-        # include_list3 = []
+        include_list3 = []
         # include_list3 = [name for name in pc.model_name_id.keys() if not name.endswith('_sample') and not name == 'background'] #不要原始obj
-        include_list3 = [name for name in pc.model_name_id.keys() if name.endswith('_sample')] #sample
+        # include_list3 = [name for name in pc.model_name_id.keys() if name.endswith('_sample')] #sample
         render_object = self.render_object(viewpoint_camera, pc, convert_SHs_python, compute_cov3D_python, scaling_modifier, override_color, depth_threshold, exclude_list3, custom_rotation, custom_translation,include_list3)
         
         result = render_composition

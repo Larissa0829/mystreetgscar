@@ -7,12 +7,45 @@ import numpy as np
 import cv2
 from PIL import Image
 
-def save_img_torch(x, name='out.png'):
+def save_img_torch(x, name='out.png', bboxes_2d=None):
+    """
+    保存图像，可选地绘制bounding box
+    Args:
+        x: torch tensor [C, H, W] 或 [H, W]
+        name: 保存路径
+        bboxes_2d: dict {obj_name: vertices}，其中vertices是draw_3d_box_on_img需要的格式
+    """
     x = (x.clamp(0., 1.).detach().cpu().numpy() * 255).astype(np.uint8)
     if x.shape[0] == 1 or x.shape[0] == 3:
         x = x.transpose(1, 2, 0)
     if x.shape[-1] == 1:
         x = x.squeeze(-1)
+    
+    # 如果是灰度图，转换为RGB
+    if len(x.shape) == 2:
+        x = np.stack([x, x, x], axis=-1)
+    
+    # 绘制bounding box
+    if bboxes_2d is not None and len(bboxes_2d) > 0:
+        # 转换为BGR格式（cv2使用BGR）
+        img_bgr = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
+        
+        # 为每个obj分配不同颜色
+        color_list = [
+            (0, 255, 0),    # 绿色
+            (255, 0, 0),    # 蓝色
+            (0, 0, 255),    # 红色
+            (255, 255, 0),  # 青色
+            (255, 0, 255),  # 洋红
+            (0, 255, 255),  # 黄色
+        ]
+        
+        for idx, (obj_name, vertices) in enumerate(bboxes_2d.items()):
+            color = color_list[idx % len(color_list)]
+            draw_3d_box_on_img(vertices, img_bgr, color=color, thickness=2)
+        
+        # 转换回RGB
+        x = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     
     img = Image.fromarray(x)
     img.save(name)
