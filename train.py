@@ -259,57 +259,132 @@ def training():
 
         # difix3d loss: 利用 Difix3D 优化未观测视角纹理，并结合 TRELLIS 几何先验进行强约束
         to_tensor = transforms.ToTensor()
-        if data_args.isDifix and iteration % 300000 == 0:
+        if data_args.isDifix and iteration % 2500 == 0:
             difix_rgb = to_tensor(difixPipe(difixPrompt, image=image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
             difix_rgb = F.interpolate(difix_rgb.unsqueeze(0), size=image.shape[-2:], mode='bilinear', align_corners=False).squeeze(0)
             Ll1 = l1_loss(image, difix_rgb, mask)
-            scalar_dict['difix3d_loss'] = Ll1.item()
             loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, difix_rgb, mask=mask))
 
         if data_args.isDifix and iteration % 250 == 1:
-            # obj + 随机移动或旋转
             if gaussians.include_obj:
-                # 1. 扩大随机旋转范围到 0-360 度，确保全方位观测监督
+                # 1. 扩大随机旋转范围到 0-360 度，模拟全视角监督
                 with torch.no_grad():
                     custom_rotation = torch.tensor([torch.randint(0, 360, (1,)).item()], dtype=torch.float32) * torch.pi / 180
-                    custom_translation = torch.zeros(1).to(device) # 可以根据需要添加位移
+                    custom_translation = torch.zeros(1).to(device)
                 
-                # 2. 构建包含原始对象和对应sample对象的列表
+                # 2. 准备对象列表 (原始点云 + TRELLIS补全点云)
                 origin_list = [name for name in gaussians.obj_list if not name.endswith('_sample') and name not in ['sky', 'background']]
-                sample_list = []
-                for obj_name in origin_list:
-                    sample_name = f"{obj_name}_sample"
-                    if hasattr(gaussians, sample_name) and sample_name in gaussians.model_name_id:
-                        sample_list.append(sample_name)
+                sample_list = [name + "_sample" for name in origin_list if hasattr(gaussians, name + "_sample")]
                 
-                # 合并原始对象和sample对象进行渲染（sample点云补充原始对象）
-                include_obj_list = origin_list + sample_list
-                
-                # 3. 渲染：rgb_obj为随机变换之后的图像（包含原始对象+sample点云补充）
-                render_out = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, custom_translation=custom_translation)
-                rgb_obj = render_out["rgb"]
-                
-                # 4. 利用 Difix3D 生成伪标签 (Pseudo-GT)
+                # 3. 多次渲染定位“观测真空区”
                 with torch.no_grad():
-                    # 也可以尝试输入 ref_image 来增强一致性（如果 difixPipe 支持）
-                    difix_res = difixPipe(difixPrompt, image=rgb_obj.detach(), num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-                    difix_rgb_obj = to_tensor(difix_res).to(device)
-                    difix_rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
+                    # 仅渲染原始观察到的点云
+                    render_origin = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, include_list=origin_list)
+                    origin_acc = render_origin["acc"]
                     
-                    # 存储图像用于 Debug
+                # 渲染完整补全后的点云
+                render_full = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, include_list=origin_list + sample_list)
+                rgb_obj = render_full["rgb"]
+                full_acc = render_full["acc"]
+                
+                # 4. 识别 unobserved_mask: 只有补全点云填充了，但原始观察没拍到的地方
+                unobserved_mask = (full_acc > 0.1) & (origin_acc < 0.3)
+                obj_mask = (full_acc > 0.1)
+
+                # 5. 利用 Difix3D 生成纹理伪标签 (低分辨率处理以节省显存)
+                with torch.no_grad():
+                    # 推理前清空缓存
+                    torch.cuda.empty_cache()
+                    
+                    # 将渲染图下采样到 512 左右进行扩散模型推理，并使用 half 精度
+                    rgb_obj_low = F.interpolate(rgb_obj.detach().unsqueeze(0), size=(768, 1152), mode='bilinear', align_corners=False).squeeze(0).half()
+                    
+                    difix_res = difixPipe(difixPrompt, image=rgb_obj_low, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+                    
+                    # 转换回 float32 并插值回原始分辨率用于 Loss
+                    difix_rgb_obj = to_tensor(difix_res).to(device).float()
+                    difix_rgb_obj = F.interpolate(difix_rgb_obj.unsqueeze(0), size=rgb_obj.shape[-2:], mode='bilinear', align_corners=False).squeeze(0)
+                    
+                    # 立即清理中间变量
+                    del rgb_obj_low, difix_res
+                    torch.cuda.empty_cache()
+                    
                     if iteration % 500 == 1:
                         save_dir = f"{cfg.model_path}/rotation_recording"
                         os.makedirs(save_dir, exist_ok=True)
-                        transform = T.ToPILImage()
-                        transform(rgb_obj.detach().cpu().clamp(0, 1)).save(os.path.join(save_dir, f"rgb_obj_{iteration}_wodifix.png"))
-                        transform(difix_rgb_obj.detach().cpu().clamp(0, 1)).save(os.path.join(save_dir, f"rgb_obj_{iteration}_wdifix.png"))
+                        T.ToPILImage()(rgb_obj.detach().cpu().clamp(0, 1)).save(os.path.join(save_dir, f"rgb_obj_{iteration}_wodifix.png"))
+                        T.ToPILImage()(difix_rgb_obj.detach().cpu().clamp(0, 1)).save(os.path.join(save_dir, f"rgb_obj_{iteration}_wdifix.png"))
                 
-                # 5. 计算 RGB 监督损失
-                Ll1_difix = l1_loss(rgb_obj, difix_rgb_obj, mask)
-                Lssim_difix = 1.0 - ssim(rgb_obj, difix_rgb_obj, mask=mask)
+                # 6. 计算 RGB 损失：在观测不到的“蓝色空洞”区赋予极高权重，强制 sample 点云存活并着色
+                loss_weight = torch.ones_like(full_acc)
+                loss_weight[unobserved_mask] = 5.0 # 高权重，防止 sample 被优化器杀死
+                
+                Ll1_difix = (torch.abs(rgb_obj - difix_rgb_obj) * loss_weight * obj_mask).mean()
                 scalar_dict['difix3d_obj_loss'] = Ll1_difix.item()
-                loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1_difix + optim_args.lambda_dssim * Lssim_difix
+                loss += Ll1_difix * optim_args.lambda_l1
 
+        # 7. TRELLIS 几何/不透明度强约束 (核心解决点云消失问题)
+        if iteration > 500 and gaussians.include_obj:
+            # A. 几何锚点损失 (Anchor Loss): 适应 Densification 的 Chamfer 距离版本
+            if iteration % 10 == 0:
+                anchor_loss = 0
+                sample_count = 0
+                for name in gaussians.model_name_id.keys():
+                    if name.endswith('_sample'):
+                        actor = getattr(gaussians, name)
+                        if not hasattr(actor, 'initial_xyz'):
+                            actor.initial_xyz = actor.get_xyz.detach().clone()
+                        
+                        curr_xyz = actor.get_xyz
+                        ref_xyz = actor.initial_xyz
+                        # 处理点数不匹配问题
+                        if curr_xyz.shape[0] == ref_xyz.shape[0]:
+                            dist = torch.norm(curr_xyz - ref_xyz, dim=-1)
+                        else:
+                            # 采样计算最近邻距离，保住几何轮廓
+                            idx = torch.randperm(curr_xyz.shape[0])[:min(8000, curr_xyz.shape[0])]
+                            tile = curr_xyz[idx]
+                            dist_sq = torch.sum(tile**2, dim=1, keepdim=True) + torch.sum(ref_xyz**2, dim=1) - 2 * torch.matmul(tile, ref_xyz.t())
+                            dist = torch.sqrt(torch.clamp(dist_sq.min(dim=1)[0], min=1e-7))
+                        
+                        anchor_loss += dist.mean()
+                        sample_count += 1
+                
+                if sample_count > 0:
+                    loss += (anchor_loss / sample_count) * 0.1 # 强形状约束
+                    scalar_dict['anchor_loss'] = (anchor_loss / sample_count).item()
+
+            # B. 不透明度保护 (Opacity Protection): 强制补全点云存活，不被 Prune 掉
+            if iteration % 50 == 0:
+                opacity_prot_loss = 0
+                for name in gaussians.model_name_id.keys():
+                    if name.endswith('_sample'):
+                        actor = getattr(gaussians, name)
+                        # 强制 sample 高斯维持最小透明度 0.5
+                        opacity_prot_loss += torch.clamp(0.5 - actor.get_opacity, min=0).mean()
+                if opacity_prot_loss > 0:
+                    loss += opacity_prot_loss * 0.05
+                    scalar_dict['opacity_prot_loss'] = opacity_prot_loss.item()
+
+            # C. 对称性损失 (Symmetry Loss)
+            from lib.utils.symmetry_utils import apply_symmetry_to_sample_objects
+            symmetry_loss = apply_symmetry_to_sample_objects(gaussians, axis=1, mirror=False, add_loss=True)
+            if symmetry_loss is not None and symmetry_loss > 0:
+                sym_weight = 0.2 if iteration > 3000 else 0.05
+                loss += symmetry_loss * sym_weight
+                scalar_dict['symmetry_loss'] = symmetry_loss.item()
+
+            # D. 缩放正则化: 防止高斯点无限膨胀
+            if iteration % 20 == 0:
+                scale_reg = 0
+                for name in gaussians.model_name_id.keys():
+                    if name.endswith('_sample'):
+                        actor = getattr(gaussians, name)
+                        scale_reg += torch.exp(actor.get_scaling).mean()
+                if scale_reg > 0:
+                    loss += scale_reg * 0.001
+                    scalar_dict['scale_reg_loss'] = scale_reg.item()
+        
 
             
         scalar_dict['loss'] = loss.item()
