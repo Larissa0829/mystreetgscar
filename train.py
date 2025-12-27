@@ -58,11 +58,9 @@ def training():
     # ============ 创建difix3d
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if data_args.isDifix:
-        # 有两种，一种是不需要ref的
-        difixPipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
-        # 一种是需要ref的
-        # difixPipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
-        difixPipe.to(device)
+        # 使用 float16 并开启 CPU 卸载以节省显存
+        difixPipe = DifixPipeline.from_pretrained("nvidia/difix", torch_dtype=torch.float16, trust_remote_code=True)
+        difixPipe.enable_model_cpu_offload() 
         difixPrompt = "remove degradation"
     # ============
 
@@ -259,12 +257,11 @@ def training():
             loss += optim_args.lambda_normal_mono * normal_loss
 
 
-        # difix3d loss: 目前想法是把difix3d嵌入 生成一个去除伪影的效果，来得到完整的车辆。（由于在渲染的时候会执行，所以训练的时候的优化有点微不足道）
+        # difix3d loss: 利用 Difix3D 优化未观测视角纹理，并结合 TRELLIS 几何先验进行强约束
         to_tensor = transforms.ToTensor()
-        if data_args.isDifix and iteration % 2500 == 0:
-            # rgb
+        if data_args.isDifix and iteration % 300000 == 0:
             difix_rgb = to_tensor(difixPipe(difixPrompt, image=image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]).to(device)
-            difix_rgb = F.interpolate(difix_rgb.unsqueeze(0), size=(1066, 1600), mode='bilinear', align_corners=False).squeeze(0)
+            difix_rgb = F.interpolate(difix_rgb.unsqueeze(0), size=image.shape[-2:], mode='bilinear', align_corners=False).squeeze(0)
             Ll1 = l1_loss(image, difix_rgb, mask)
             scalar_dict['difix3d_loss'] = Ll1.item()
             loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, difix_rgb, mask=mask))
@@ -289,7 +286,7 @@ def training():
                 include_obj_list = origin_list + sample_list
                 
                 # 3. 渲染：rgb_obj为随机变换之后的图像（包含原始对象+sample点云补充）
-                render_out = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, custom_translation=custom_translation, include_list=include_obj_list)
+                render_out = gaussians_renderer.render_object(viewpoint_cam, gaussians, custom_rotation=custom_rotation, custom_translation=custom_translation)
                 rgb_obj = render_out["rgb"]
                 
                 # 4. 利用 Difix3D 生成伪标签 (Pseudo-GT)
@@ -313,25 +310,7 @@ def training():
                 scalar_dict['difix3d_obj_loss'] = Ll1_difix.item()
                 loss += (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1_difix + optim_args.lambda_dssim * Lssim_difix
 
-        # # 6. 利用 TRELLIS 的对称性先验（非常重要：解决非观测区域空洞）
-        # if iteration > 1000 and iteration % 5 == 0 and gaussians.include_obj:
-        #     from lib.utils.symmetry_utils import apply_symmetry_to_sample_objects
-        #     # 对 sample 对象（即由 TRELLIS 初始化的部分）应用对称性损失
-        #     # axis=1 通常对应车辆的左右对称轴
-        #     symmetry_loss = apply_symmetry_to_sample_objects(
-        #         gaussians, 
-        #         axis=1, 
-        #         mirror=False,  # 不主动镜像点，只计算 Loss
-        #         add_loss=True
-        #     )
-        #     if symmetry_loss is not None and symmetry_loss > 0:
-        #         # 这里的权重可以适当调大一点，以强制形状对齐
-        #         sym_weight = 0.1 
-        #         scalar_dict['symmetry_loss'] = symmetry_loss.item()
-        #         loss += symmetry_loss * sym_weight
 
-        # # 7. 几何形状正则化：防止 sample 高斯偏离 TRELLIS 提供的基础几何
-        # # 如果需要更强的约束，可以添加对 _sample 对象的位置正则化（此处保留逻辑接口）
             
         scalar_dict['loss'] = loss.item()
 
