@@ -384,6 +384,68 @@ def training():
                 if scale_reg > 0:
                     loss += scale_reg * 0.001
                     scalar_dict['scale_reg_loss'] = scale_reg.item()
+            
+            # E. 颜色正则化: 防止sample点云颜色退化（如变蓝色）
+            # 约束sample点云的颜色特征保持与原始对象相近的分布
+            if iteration % 5 == 0 and iteration > 500:
+                color_reg_loss = 0
+                sample_count = 0
+                for name in gaussians.model_name_id.keys():
+                    if name.endswith('_sample'):
+                        # 获取对应的原始对象
+                        origin_name = name.replace('_sample', '')
+                        if origin_name in gaussians.model_name_id:
+                            sample_actor = getattr(gaussians, name)
+                            origin_actor = getattr(gaussians, origin_name)
+                            
+                            # 获取颜色特征 (DC分量最重要)
+                            sample_colors = sample_actor._features_dc  # [N_sample, F, 3]
+                            origin_colors = origin_actor._features_dc  # [N_origin, F, 3]
+                            
+                            # 计算原始对象颜色的统计量
+                            origin_mean = origin_colors.mean(dim=0, keepdim=True)  # [1, F, 3]
+                            origin_std = origin_colors.std(dim=0, keepdim=True) + 1e-6  # [1, F, 3]
+                            
+                            # 约束1: sample颜色的均值接近原始对象
+                            sample_mean = sample_colors.mean(dim=0, keepdim=True)
+                            mean_diff = torch.abs(sample_mean - origin_mean).mean()
+                            
+                            # 约束2: sample颜色的标准差不要过大（防止颜色发散）
+                            sample_std = sample_colors.std(dim=0, keepdim=True) + 1e-6
+                            std_diff = torch.abs(sample_std - origin_std).mean()
+                            
+                            # 约束3: 直接约束每个点的颜色不要偏离原始颜色范围太远
+                            # 计算原始颜色的范围（min, max）
+                            origin_min = origin_colors.min(dim=0, keepdim=True)[0] - 0.5  # 允许一定容差
+                            origin_max = origin_colors.max(dim=0, keepdim=True)[0] + 0.5
+                            
+                            # 惩罚超出范围的sample颜色
+                            below_min = torch.clamp(origin_min - sample_colors, min=0)
+                            above_max = torch.clamp(sample_colors - origin_max, min=0)
+                            range_violation = (below_min.mean() + above_max.mean())
+                            
+                            # 约束4: 特别约束蓝色通道（第3个通道）不要过高
+                            # RGB的第3个通道是蓝色
+                            blue_channel = sample_colors[:, :, 2]  # [N_sample, F]
+                            origin_blue_mean = origin_colors[:, :, 2].mean()
+                            origin_blue_max = origin_colors[:, :, 2].max()
+                            # 如果sample的蓝色超过原始的最大值，施加惩罚
+                            blue_excess = torch.clamp(blue_channel - origin_blue_max, min=0).mean()
+                            
+                            color_reg_loss += mean_diff + 0.5 * std_diff + 2.0 * range_violation + 3.0 * blue_excess
+                            sample_count += 1
+                
+                if sample_count > 0:
+                    # 更激进的权重调度
+                    if iteration < 10000:
+                        color_reg_weight = 0.5
+                    elif iteration < 20000:
+                        color_reg_weight = 1.0
+                    else:
+                        color_reg_weight = 2.0  # 两万轮后大幅增强
+                    
+                    loss += (color_reg_loss / sample_count) * color_reg_weight
+                    scalar_dict['color_reg_loss'] = (color_reg_loss / sample_count).item()
         
 
             
